@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex" />
+<title>Install Protection</title>
+<!--
+  The enrollment / first-install page for the Protection app.
+
+  Served free from GitHub Pages on the public releases repo, deliberately NOT
+  from the dashboard (Vercel): a paused Vercel deployment must not be able to
+  block adding a new phone, the same reason self-update moved here. It is a
+  static page — it cannot check whether the pairing code is still live the way
+  the old dashboard page did, and it does not need to: the code is validated for
+  real when the new phone enrolls (and the owner still approves it). The code in
+  the ?code= query is shown only as a convenience so the person holding the new
+  phone does not have to glance back at the owner's screen.
+
+  The download links point at the release channel's stable "latest" alias, so
+  this file never changes when a new build ships.
+-->
+<style>
+  :root {
+    --bg: #0f1115;
+    --card: #161a21;
+    --border: #2a2f3a;
+    --text: #e7ebf0;
+    --muted: #9aa4b2;
+    --green: #3f8f52;
+    --green-press: #367a47;
+    --code: #9db7ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 440px; margin: 0 auto; padding: 32px 20px 56px; }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .lead { color: var(--muted); margin: 0 0 24px; font-size: 15px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px 20px;
+    margin-bottom: 20px;
+  }
+  .btn {
+    display: block;
+    width: 100%;
+    text-align: center;
+    padding: 15px 18px;
+    border-radius: 12px;
+    background: var(--green);
+    color: #041a0b;
+    font-weight: 700;
+    font-size: 16px;
+    text-decoration: none;
+  }
+  .btn:active { background: var(--green-press); }
+  .btn-sub {
+    display: block;
+    text-align: center;
+    margin-top: 14px;
+    color: var(--muted);
+    font-size: 13px;
+    text-decoration: none;
+  }
+  .btn-sub u { text-decoration: underline; }
+  .code-block { text-align: center; margin: 4px 0 0; }
+  .code-label { color: var(--muted); font-size: 14px; margin: 0 0 8px; }
+  .code {
+    font-size: 34px;
+    letter-spacing: 10px;
+    font-weight: 700;
+    color: var(--code);
+    padding-left: 10px; /* balance the trailing letter-spacing */
+  }
+  ol { padding-left: 22px; margin: 0; }
+  ol li { margin-bottom: 10px; }
+  ol li:last-child { margin-bottom: 0; }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 24px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Install Protection</h1>
+    <p class="lead">On the phone you want to track, download the app below, then open it and enroll with your pairing code.</p>
+
+    <div class="card">
+      <a class="btn" id="download" href="https://github.com/protection-dev/protection-releases/releases/latest/download/app-arm64-v8a-debug.apk">Download Protection</a>
+      <a class="btn-sub" href="https://github.com/protection-dev/protection-releases/releases/latest/download/app-armeabi-v7a-debug.apk">Using an older 32-bit phone? <u>Download the 32-bit build</u></a>
+    </div>
+
+    <div class="card" id="code-card" hidden>
+      <div class="code-block">
+        <p class="code-label">Then in the app, choose <strong>Tracked phone</strong> and enter this pairing code:</p>
+        <div class="code" id="code"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <ol>
+        <li>Open the downloaded file and tap <strong>Install</strong>.</li>
+        <li>If asked, allow installing from this source — a one-time prompt.</li>
+        <li>Open <strong>Protection</strong>, choose <strong>Tracked phone</strong>, and enter the pairing code shown on the other phone.</li>
+      </ol>
+    </div>
+
+    <p class="foot">Only install this on a phone you own or are authorized to manage.</p>
+  </main>
+
+  <script>
+    // Show the pairing code from ?code= as a convenience. Purely display: the
+    // code is validated when the phone actually enrolls, never here.
+    try {
+      var code = new URLSearchParams(location.search).get('code');
+      if (code && /^[0-9]{4,10}$/.test(code)) {
+        document.getElementById('code').textContent = code;
+        document.getElementById('code-card').hidden = false;
+      }
+    } catch (e) { /* no code shown; the app still asks for it */ }
+  </script>
+</body>
+</html>
