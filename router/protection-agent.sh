@@ -7,6 +7,7 @@
 #   protection-agent status                   enrolment, service and positioning state
 #   protection-agent report                   print the report it would write (nothing sent)
 #   protection-agent wifipos off | on         stop (or resume) Wi-Fi positioning
+#   protection-agent doctor                   what this router lets the agent measure
 #   protection-agent uninstall                stop and remove everything it installed
 #
 # Written for BusyBox ash and BusyBox awk: POSIX only, no bashisms. It sleeps
@@ -20,7 +21,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.4.1 (10)"
+PA_AGENT_VERSION="1.5.0 (11)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -812,6 +813,13 @@ function flush() {
     wband[cur] = curband; wsig[cur] = sig; wct[cur] = sct
     if (sdn ~ /^[0-9]+$/ && sup ~ /^[0-9]+$/) { wdn[cur] = sdn; wup[cur] = sup }
     wld[cur] = sld; wlu[cur] = slu
+    # What the driver gave, counted once per station: the capabilities and doctor.
+    if (!(cur in probed)) {
+      probed[cur] = 1; nsta++
+      if (sig != "") nsig++
+      if (cur in wdn) ndata++
+      if (sld + 0 > 0 || slu + 0 > 0) nrate++
+    }
     remember(cur)
     if (!(cur in counted)) { counted[cur] = 1; rcount[curparent]++ }
   }
@@ -829,6 +837,7 @@ function grew(now, before, ct, pct) {
 # A link rate in Mbit/s. Under 6.5 (the slowest 802.11n data rate) is a keep-alive
 # or a management frame sent at a basic rate, which says nothing about the link.
 function mbps(v) { return (v + 0 >= 6.5) ? sprintf("%.0f", v + 0) : "" }
+function capadd(acc, name) { if (acc != "") acc = acc ","; return acc fstr(name) }
 FILENAME == leases {
   m = tolower($2)
   if (macok(m)) { lip[m] = $3; if ($4 != "*" && $4 != "") lname[m] = $4 }
@@ -925,7 +934,7 @@ END {
       util = int(100 * (sbusy[r] - pbusy[r]) / (sact[r] - pact[r]))
       if (util < 0) util = 0; if (util > 100) util = 100
     }
-    if (r in sact) printf("%s %s %s\n", r, sact[r], sbusy[r]) > surveyout
+    if (r in sact) { printf("%s %s %s\n", r, sact[r], sbusy[r]) > surveyout; nsurv++ }
     x = ""
     x = put(x, "band", fstr(bandname(rband[i])))
     x = put(x, "ssid", fstr(rssid[i]))
@@ -1041,6 +1050,21 @@ END {
   rt = put(rt, "clientUsageSince", fint(ENVIRON["PJ_USINCE"]))
   rt = put(rt, "clients", farr(clients))
   rt = put(rt, "radios", farr(radios))
+  # What this router lets the agent measure, so the apps can say what it cannot
+  # rather than leave a figure blank. From what the tools gave, before any of it
+  # was filtered: a device whose link rates were all keep-alives still has them.
+  # The client ones are only known while a Wi-Fi device is connected.
+  caps = ""
+  if (ENVIRON["PJ_TC"] != "") caps = capadd(caps, "TEMPERATURE")
+  if (nsurv > 0) caps = capadd(caps, "AIRTIME")
+  if (nsig > 0) caps = capadd(caps, "CLIENT_SIGNAL")
+  if (ndata > 0) caps = capadd(caps, "CLIENT_DATA")
+  if (nrate > 0) caps = capadd(caps, "CLIENT_LINK_RATE")
+  rt = put(rt, "capabilities", farr(caps))
+  if (probeout != "") {
+    printf("stations %d\nsignal %d\ndata %d\nrate %d\nradios %d\nairtime %d\n", nsta, nsig, ndata, nrate, nr, nsurv) > probeout
+    close(probeout)
+  }
 
   stamp = "{\"timestampValue\":\"" ENVIRON["PJ_ISO"] "\"}"
   out = ""
@@ -1475,6 +1499,7 @@ pa_build_report() {
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
       -v prevsta="$_sta" -v staout="$PA_TMP.sta.new" -v usage="$_use" -v usageout="$PA_TMP.usage.new" \
+      -v probeout="${PA_PROBE_OUT:-}" \
       -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
       -v maxc="$PA_MAX_CLIENTS" -v hmax="$PA_HISTORY_MAX" -v hspace="$PA_HISTORY_SPACING" \
       -v hage="$PA_HISTORY_AGE" "$PA_AWK_ESC$PA_AWK_REPORT" \
@@ -1489,6 +1514,7 @@ pa_build_report() {
     if [ -f "$PA_TMP.usage.new" ]; then mv -f "$PA_TMP.usage.new" "$PA_TMP.usage"; else rm -f "$PA_TMP.usage"; fi
   fi
   rm -f "$PA_TMP.sta.new" "$PA_TMP.usage.new"
+  [ -n "${PA_PROBE_OUT:-}" ] && cp "$PA_TMP.wifi" "$PA_PROBE_OUT.wifi" 2>/dev/null
   rm -f "$PA_TMP.wifi" "$PA_TMP.names"
   return $_rc
 }
@@ -2387,6 +2413,103 @@ pa_status() {
   esac
 }
 
+# One line of the doctor: a label padded to a column, then what was found.
+pa_doc() { printf '%-12s %s\n' "$1" "$2"; }
+
+# Shows what this router lets the agent measure, from one dry-run report: what
+# the apps will show, what they cannot, and why. Ends with one station's raw
+# output with its MAC addresses hidden, for adding a router model to the tests.
+# Sends nothing, and prints no credential.
+pa_doctor() {
+  PA_DRY=1
+  mkdir -p "$(dirname "$PA_TMP")"
+  pa_init_platform
+  pa_clock
+  pa_nvram_snapshot
+  pa_identity
+  PA_PROBE_OUT="$PA_TMP.probe"
+  rm -f "$PA_PROBE_OUT" "$PA_PROBE_OUT.wifi"
+  pa_build_report > /dev/null
+  rm -f "$PA_TMP.history.new"
+  _stations=0 _signal=0 _data=0 _rate=0 _radios=0 _airtime=0
+  if [ -r "$PA_PROBE_OUT" ]; then
+    while read -r _k _v; do
+      pa_isnum "$_v" || continue
+      case $_k in
+        stations) _stations=$_v ;;
+        signal) _signal=$_v ;;
+        data) _data=$_v ;;
+        rate) _rate=$_v ;;
+        radios) _radios=$_v ;;
+        airtime) _airtime=$_v ;;
+      esac
+    done < "$PA_PROBE_OUT"
+  fi
+
+  pa_say "Protection agent $PA_AGENT_VERSION: what this router can report"
+  pa_doc Router: "${PA_MF:+$PA_MF }${PA_MODEL:-unknown model}, ${PA_FW:-unknown firmware}"
+  _bb=''
+  pa_have busybox && _bb=$(busybox 2>&1 | awk '/^BusyBox v/ { print $1, $2; exit }')
+  # Asked of the shell itself: past 2^31 a 32-bit shell wraps, which is why the
+  # agent does its large numbers in awk.
+  _bits=64
+  [ $((2147483647 + 1)) -gt 0 ] || _bits=32
+  pa_doc Platform: "$PA_PLATFORM${_bb:+, $_bb}, $_bits-bit shell numbers"
+  if pa_load_conf 2>/dev/null; then pa_doc Enrolled: "yes (Firebase project $PA_PROJECT)"; else pa_doc Enrolled: no; fi
+  _tools=''
+  for _t in curl iw wl nvram uci; do
+    if pa_have "$_t"; then _tools="$_tools $_t yes,"; else _tools="$_tools $_t no,"; fi
+  done
+  _tools=${_tools%,}
+  pa_doc Tools: "${_tools# }"
+  if [ -n "${PA_WAN_DEV:-}" ] && [ -r "$PA_ROOT/sys/class/net/$PA_WAN_DEV/statistics/rx_bytes" ]; then
+    pa_doc Internet: "WAN ${PA_WAN_DEV}${PA_WAN_TYPE:+ ($PA_WAN_TYPE)}, traffic counters readable"
+  else
+    pa_doc Internet: "no WAN interface found: no traffic figures"
+  fi
+  _health='CPU and memory'
+  [ -r "$PA_ROOT/proc/meminfo" ] || _health='CPU (no memory figures)'
+  if [ -n "${PA_TEMP:-}" ]; then _health="$_health, temperature $PA_TEMP C"; else _health="$_health, no temperature sensor"; fi
+  [ -n "${PA_FAN:-}" ] && _health="$_health, fan $PA_FAN rpm"
+  pa_doc Health: "$_health"
+  pa_doc Wi-Fi: "$_radios radio(s), $_stations device(s) connected"
+  _missing=''
+  if [ "$_radios" -gt 0 ]; then
+    if [ "$_airtime" -gt 0 ]; then
+      pa_doc "  airtime" yes
+    else
+      pa_doc "  airtime" "no (this router gives the agent no channel survey)"
+      _missing="$_missing, Wi-Fi airtime"
+    fi
+  fi
+  [ -n "${PA_TEMP:-}" ] || _missing="$_missing, temperature"
+  if [ "$_stations" -gt 0 ]; then
+    pa_doc "  signal" "$_signal of $_stations devices"
+    pa_doc "  data used" "$_data of $_stations devices"
+    pa_doc "  link speed" "$_rate of $_stations devices"
+    [ "$_signal" -gt 0 ] || _missing="$_missing, device signal"
+    [ "$_data" -gt 0 ] || _missing="$_missing, data per device"
+    [ "$_rate" -gt 0 ] || _missing="$_missing, link speed per device"
+  else
+    pa_say "  (connect a Wi-Fi device to see what the driver gives per device)"
+  fi
+  if [ -n "$_missing" ]; then pa_doc Unavailable: "${_missing#, }"; else pa_doc Unavailable: "nothing missing"; fi
+  # One station, as the driver printed it, every MAC address hidden.
+  if [ -s "$PA_PROBE_OUT.wifi" ]; then
+    pa_say ''
+    pa_say 'One Wi-Fi device as the driver reports it (MAC addresses hidden):'
+    awk '
+      /^@STA\t/ || /^Station / { if (seen) exit; seen = 1 }
+      /^@/ { if (seen && $0 !~ /^@STA\t/) exit; if ($0 !~ /^@STA\t/) next }
+      seen {
+        line = $0
+        gsub(/[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]:[0-9A-Fa-f][0-9A-Fa-f]/, "xx:xx:xx:xx:xx:xx", line)
+        if (line !~ /^@/) print "  " line
+      }' "$PA_PROBE_OUT.wifi"
+  fi
+  rm -f "$PA_PROBE_OUT" "$PA_PROBE_OUT.wifi"
+}
+
 pa_main() {
   pa_detect_platform
   _cmd=${1:-status}
@@ -2413,9 +2536,10 @@ pa_main() {
       rm -f "$PA_TMP.history.new"
       ;;
     wifipos) pa_wifipos "$@" ;;
+    doctor) pa_doctor ;;
     uninstall) pa_uninstall ;;
     version) pa_say "$PA_AGENT_VERSION" ;;
-    *) pa_die "unknown command '$_cmd'. Use setup, start, stop, status, report, wifipos or uninstall." ;;
+    *) pa_die "unknown command '$_cmd'. Use setup, start, stop, status, report, wifipos, doctor or uninstall." ;;
   esac
 }
 
