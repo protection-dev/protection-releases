@@ -1,8 +1,8 @@
 {
-  "versionCode": 750,
-  "versionName": "1.0.0+05855aa",
+  "versionCode": 753,
+  "versionName": "1.0.0+e28c8d0",
   "builds": {
-    "arm64-v8a": { "sha256": "8e1310cf8b2666c6be7edf1aef9ae1f105e39b139af00325ca53e5bf320e9026", "sizeBytes": 39602239 },
-    "armeabi-v7a": { "sha256": "b984485e8fe3d019a47e9d7d2f5ba6aca71bba8faa8f599e86e7671bac4b2d22", "sizeBytes": 34635221 }
+    "arm64-v8a": { "sha256": "6f7b9a0c741b1a0789c718610ca033e25346d056516180d518392392a83f0f24", "sizeBytes": 39618623 },
+    "armeabi-v7a": { "sha256": "cf14ce61d74e628a862f8e526f6576a9977a217fd59ea9b3a267cc058921ff64", "sizeBytes": 34651605 }
   }
 }
