@@ -8,6 +8,7 @@
 #   protection-agent report                   print the report it would write (nothing sent)
 #   protection-agent wifipos off | on         stop (or resume) Wi-Fi positioning
 #   protection-agent doctor                   what this router lets the agent measure
+#   protection-agent update                   sync the agent with the one on GitHub
 #   protection-agent uninstall                stop and remove everything it installed
 #
 # Written for BusyBox ash and BusyBox awk: POSIX only, no bashisms. It sleeps
@@ -21,7 +22,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.5.1 (12)"
+PA_AGENT_VERSION="1.6.0 (13)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -86,6 +87,19 @@ PA_GEO_RETRY=3600
 PA_GEO_MAX_APS=20
 PA_GEO_MAX_ACC=1000
 PA_SCAN_WAIT="${PA_SCAN_WAIT:-4}"
+# Self-update: the agent on main of the public releases repo, the very file the
+# install line downloads. Fixed here, never read from the device document: the
+# owner's Update is a bare timestamp, so the most it can do is make the router
+# fetch this file.
+PA_UPDATE_URL="${PA_UPDATE_URL:-https://raw.githubusercontent.com/protection-dev/protection-releases/main/router/protection-agent.sh}"
+# An owner's Update is answered while it is this young:
+# TrackingConfig.ROUTER_AGENT_UPDATE_TIMEOUT_MS, when the app stops waiting.
+PA_UPDATE_WINDOW=600
+# A new agent is on trial until its first report. Started this many times without
+# getting there, or not there this long after starting, it gives way to the agent
+# it replaced.
+PA_TRIAL_STARTS=3
+PA_TRIAL_DEADLINE=1800
 
 # -- Small helpers -----------------------------------------------------------------
 
@@ -1081,6 +1095,8 @@ END {
     printf("stations %d\nsignal %d\ndata %d\nrate %d\nradios %d\nairtime %d\n", nsta, nsig, ndata, nrate, nr, nsurv) > probeout
     close(probeout)
   }
+  # This agent answers an Update from the owner: the apps offer one only to an agent that says so.
+  rt = put(rt, "selfUpdate", "{\"booleanValue\":true}")
 
   stamp = "{\"timestampValue\":\"" ENVIRON["PJ_ISO"] "\"}"
   out = ""
@@ -1761,6 +1777,8 @@ pa_token() {
 # Reads its own device document: the standing and the owner's requests, one read.
 # Sets PA_S (APPROVED, PENDING_APPROVAL, REJECTED, REMOVED, UNKNOWN, or AUTH when
 # the token was refused), and PA_REQ, PA_DONE, PA_ACTIVE as epoch seconds or empty.
+# The owner's Update comes as PA_UPD_REQ (epoch seconds) with its timestamp as
+# written, PA_UPD_REQ_RAW, and the one last answered, PA_UPD_SERVED_RAW.
 # 1 when Firebase could not be reached.
 pa_poll() {
   PA_S=UNKNOWN
@@ -1770,7 +1788,10 @@ pa_poll() {
   PA_PIN_LAT=''
   PA_PIN_LON=''
   PA_PIN_ACC=''
-  pa_http GET "$PA_DEVICE_URL?mask.fieldPaths=enrollmentStatus&mask.fieldPaths=locationRequestedAt&mask.fieldPaths=locationRequestFulfilledAt&mask.fieldPaths=ownerActiveAt&mask.fieldPaths=pinnedLatitude&mask.fieldPaths=pinnedLongitude&mask.fieldPaths=pinnedAccuracyMeters" '' '' 1 || return 1
+  PA_UPD_REQ=''
+  PA_UPD_REQ_RAW=''
+  PA_UPD_SERVED_RAW=''
+  pa_http GET "$PA_DEVICE_URL?mask.fieldPaths=enrollmentStatus&mask.fieldPaths=locationRequestedAt&mask.fieldPaths=locationRequestFulfilledAt&mask.fieldPaths=ownerActiveAt&mask.fieldPaths=pinnedLatitude&mask.fieldPaths=pinnedLongitude&mask.fieldPaths=pinnedAccuracyMeters&mask.fieldPaths=agentUpdateRequestedAt&mask.fieldPaths=agentUpdateServedAt" '' '' 1 || return 1
   case $PA_STATUS in
     200) ;;
     401)
@@ -1793,6 +1814,10 @@ pa_poll() {
   pa_fsval PA_PIN_LAT pinnedLatitude
   pa_fsval PA_PIN_LON pinnedLongitude
   pa_fsval PA_PIN_ACC pinnedAccuracyMeters
+  # An Update: the raw timestamps too, since the answer echoes the request's own
+  # (the server's clock, not the router's) and a new request is one that differs.
+  pa_fsval PA_UPD_REQ_RAW agentUpdateRequestedAt && pa_epoch PA_UPD_REQ "$PA_UPD_REQ_RAW"
+  pa_fsval PA_UPD_SERVED_RAW agentUpdateServedAt
   return 0
 }
 
@@ -1806,6 +1831,32 @@ pa_write_report() {
   [ "${PA_HAS_POSITION:-0}" = 1 ] && _mask="$_mask&updateMask.fieldPaths=latitude&updateMask.fieldPaths=longitude&updateMask.fieldPaths=accuracyMeters&updateMask.fieldPaths=positionSource&updateMask.fieldPaths=locationCapturedAt"
   [ "$2" = 1 ] && _mask="$_mask&updateMask.fieldPaths=locationRequestFulfilledAt"
   pa_http PATCH "$PA_DEVICE_URL?$_mask" "$1" application/json 1 || return 1
+  case $PA_STATUS in
+    200) return 0 ;;
+    401) PA_ID_TOKEN='' ;;
+  esac
+  return 2
+}
+
+# pa_write_update STATE DETAIL [SERVED]: how the owner's Update is going, one of
+# AgentUpdateState's names, with a line for the owner (none clears it: a masked
+# path left out of the body is deleted). SERVED, the request's own timestamp,
+# marks that request answered. 0 written, 1 no answer, 2 refused.
+pa_write_update() {
+  _umask='updateMask.fieldPaths=agentUpdateState&updateMask.fieldPaths=agentUpdateDetail'
+  [ -n "${3:-}" ] && _umask="$_umask&updateMask.fieldPaths=agentUpdateServedAt"
+  PJ_US=$1 PJ_UD=$2 PJ_UV=${3:-} awk "$PA_AWK_ESC"'
+    BEGIN {
+      printf "{\"fields\":{\"agentUpdateState\":{\"stringValue\":\"%s\"}", esc(ENVIRON["PJ_US"])
+      if (ENVIRON["PJ_UD"] != "") printf ",\"agentUpdateDetail\":{\"stringValue\":\"%s\"}", esc(ENVIRON["PJ_UD"])
+      if (ENVIRON["PJ_UV"] != "") printf ",\"agentUpdateServedAt\":{\"timestampValue\":\"%s\"}", esc(ENVIRON["PJ_UV"])
+      printf "}}\n"
+    }' > "$PA_TMP.upd"
+  [ -s "$PA_TMP.upd" ] || return 2
+  pa_http PATCH "$PA_DEVICE_URL?$_umask" "$PA_TMP.upd" application/json 1
+  _wrc=$?
+  rm -f "$PA_TMP.upd"
+  [ "$_wrc" = 0 ] || return 1
   case $PA_STATUS in
     200) return 0 ;;
     401) PA_ID_TOKEN='' ;;
@@ -2008,10 +2059,11 @@ pa_again() {
   return 0
 }
 
-# One contact: read the device document, then write a full report if one is due:
-# five minutes since the last, an owner Refresh waiting, the owner watching the
-# router's page, or the first since approval. Sets PA_NEXT, the seconds until the
-# next contact. 1 when Firebase could not be reached at all.
+# One contact: read the device document, answer an owner's Update if one is
+# waiting, then write a full report if one is due: five minutes since the last, an
+# owner Refresh waiting, the owner watching the router's page, or the first since
+# approval. Sets PA_NEXT, the seconds until the next contact. 1 when Firebase
+# could not be reached at all.
 pa_contact() {
   pa_token
   case $? in
@@ -2030,16 +2082,35 @@ pa_contact() {
   case $PA_S in
     APPROVED) ;;
     PENDING_APPROVAL)
+      # It read and understood its own document: enough to settle in, with no
+      # report to write until it is approved.
+      pa_trial_pass
       PA_NEXT=$PA_PENDING_INTERVAL
       PA_LAST_FULL=''
       return 0
       ;;
     *)
+      case $PA_S in REJECTED | REMOVED) pa_trial_pass ;; esac
       PA_NEXT=$PA_DORMANT_INTERVAL
       PA_LAST_FULL=''
       return 0
       ;;
   esac
+  pa_update_say || return 1
+  # The owner's Update: answered once, while the app is still waiting for it.
+  if [ -n "$PA_UPD_REQ" ] && [ "$PA_UPD_REQ_RAW" != "$PA_UPD_SERVED_RAW" ] &&
+    [ $((PA_WALL - PA_UPD_REQ)) -le "$PA_UPDATE_WINDOW" ]; then
+    pa_owner_update
+    case $? in
+      1) return 1 ;;
+      # Replaced. In service the new agent has taken this process over by now;
+      # only the tests' stand-in for that comes back here.
+      3)
+        PA_NEXT=$PA_IDLE_INTERVAL
+        return 0
+        ;;
+    esac
+  fi
   _hot=0
   if [ -n "$PA_ACTIVE" ] && [ $((PA_WALL - PA_ACTIVE)) -ge 0 ] && [ $((PA_WALL - PA_ACTIVE)) -le "$PA_HOT_WINDOW" ]; then
     _hot=1
@@ -2068,6 +2139,7 @@ pa_contact() {
       PA_PENDING_FULL=0
       pa_keep_history
       pa_rates_reset
+      pa_trial_pass
       ;;
     1) return 1 ;;
   esac
@@ -2109,6 +2181,9 @@ pa_run() {
   pa_clock
   pa_accumulate
   pa_cpu
+  # Fresh from an update (or back from one that failed): may hand over to the
+  # agent this one replaced, here and now.
+  pa_trial_begin
 
   PA_LAST_FULL=''
   PA_PENDING_FULL=1
@@ -2123,6 +2198,9 @@ pa_run() {
     _loops=$((_loops + 1))
     [ -n "${PA_MAX_LOOPS:-}" ] && [ "$_loops" -gt "$PA_MAX_LOOPS" ] && break
     pa_clock
+    if [ "$PA_TRIAL" = 1 ] && [ $((PA_NOW - PA_TRIAL_AT)) -ge "$PA_TRIAL_DEADLINE" ]; then
+      pa_rollback "$PA_TRIAL_FROM" "could not report"
+    fi
     pa_wall
     # Before NTP has set the clock, every timestamp would be wrong and TLS fails.
     if [ "$PA_WALL" -lt "$PA_MIN_EPOCH" ]; then
@@ -2221,6 +2299,255 @@ pa_stop() {
   return 0
 }
 
+# -- Self-update ----------------------------------------------------------------------
+#
+# The owner's Update (or `protection-agent update` in the router's shell) syncs the
+# installed agent with the one on GitHub (PA_UPDATE_URL). A file that differs
+# replaces it, and the running agent re-executes into the new one in the same
+# process. The agent it replaced is kept beside it (.prev), and the new one is on
+# trial (.trial) until it writes its first report or reads its standing: dying
+# before that PA_TRIAL_STARTS times, or getting nowhere for PA_TRIAL_DEADLINE, it
+# gives way to the one it replaced, which tells the owner why. Flash is only
+# written when there is a new agent: it, its predecessor and the few-line .trial.
+
+# pa_check_agent FILE: whether FILE is a whole agent that runs here: the first
+# line, a version, the last line (a download cut short can still be valid shell),
+# valid shell, and its own `version` answering with the version it declares. Sets
+# PA_NEW_VERSION.
+pa_check_agent() {
+  PA_NEW_VERSION=''
+  pa_read _cl "$1" || return 1
+  [ "$_cl" = '#!/bin/sh' ] || return 1
+  _cv=$(sed -n 's/^PA_AGENT_VERSION="\([^"]*\)"$/\1/p' "$1" | head -n 1)
+  [ -n "$_cv" ] || return 1
+  case $(tail -n 1 "$1") in
+    *'pa_main "$@"'*) ;;
+    *) return 1 ;;
+  esac
+  sh -n "$1" 2>/dev/null || return 1
+  [ "$(PA_SOURCED=0 sh "$1" version 2>/dev/null)" = "$_cv" ] || return 1
+  PA_NEW_VERSION=$_cv
+}
+
+# Whether two files hold the same bytes. With neither cmp nor a checksum tool to
+# tell, the versions decide.
+pa_same() {
+  [ -r "$2" ] || return 1
+  if pa_have cmp; then
+    cmp -s "$1" "$2"
+    return
+  fi
+  for _sum in md5sum sha256sum; do
+    if pa_have "$_sum"; then
+      [ "$("$_sum" < "$1")" = "$("$_sum" < "$2")" ]
+      return
+    fi
+  done
+  [ "$PA_NEW_VERSION" = "$PA_AGENT_VERSION" ]
+}
+
+# Installs the checked FILE as the agent: the installed one is kept as .prev, and
+# .trial names the two (and counts the new one's starts). Mid-trial, the agent
+# from before the trial stays the one kept. The trial file goes first, so a power
+# cut after the swap still finds the new agent on trial. 0 done, 1 nothing changed.
+pa_swap_agent() {
+  _from=$PA_AGENT_VERSION
+  _kept=0
+  if [ -f "$PA_BIN.prev" ] && [ -r "$PA_BIN.trial" ]; then
+    _sk=''
+    _sfrom=''
+    { read -r _sk; read -r _sn; read -r _sfrom; } < "$PA_BIN.trial"
+    if [ "$_sk" = trial ] && [ -n "$_sfrom" ]; then
+      _from=$_sfrom
+      _kept=1
+    fi
+  fi
+  if [ "$_kept" = 0 ]; then
+    rm -f "$PA_BIN.prev"
+    if ! cp "$PA_BIN" "$PA_BIN.prev" 2>/dev/null; then
+      rm -f "$PA_BIN.prev"
+      return 1
+    fi
+  fi
+  if printf 'trial\n0\n%s\n%s\n' "$_from" "$PA_NEW_VERSION" > "$PA_BIN.trial.new" 2>/dev/null &&
+    cp "$1" "$PA_BIN.new" 2>/dev/null && chmod 755 "$PA_BIN.new" &&
+    mv -f "$PA_BIN.trial.new" "$PA_BIN.trial" && mv -f "$PA_BIN.new" "$PA_BIN"; then
+    return 0
+  fi
+  rm -f "$PA_BIN.new" "$PA_BIN.trial.new"
+  [ "$_kept" = 0 ] && rm -f "$PA_BIN.prev" "$PA_BIN.trial"
+  return 1
+}
+
+# Brings the installed agent in line with the one on GitHub. 0 already the same,
+# 3 replaced (PA_NEW_VERSION is installed, on trial), 1 not, with the reason for
+# the owner in PA_SYNC_WHY.
+pa_sync() {
+  PA_SYNC_WHY=''
+  _cand="$PA_TMP.agent"
+  rm -f "$_cand"
+  # A query string of its own on every fetch: GitHub's CDN keeps a raw file for
+  # minutes, and a sync has to see main as it is now.
+  if ! pa_http GET "$PA_UPDATE_URL?t=$PA_WALL" '' '' 0; then
+    PA_SYNC_WHY="could not reach GitHub"
+    return 1
+  fi
+  if [ "$PA_STATUS" != 200 ] || ! mv -f "$PA_TMP.resp" "$_cand"; then
+    PA_SYNC_WHY="GitHub answered HTTP $PA_STATUS"
+    return 1
+  fi
+  if ! pa_check_agent "$_cand"; then
+    rm -f "$_cand"
+    PA_SYNC_WHY="the download was not a working agent"
+    return 1
+  fi
+  if pa_same "$_cand" "$PA_BIN"; then
+    rm -f "$_cand"
+    return 0
+  fi
+  if ! pa_swap_agent "$_cand"; then
+    rm -f "$_cand"
+    PA_SYNC_WHY="no room for it in the router's storage"
+    return 1
+  fi
+  rm -f "$_cand"
+  pa_log "agent updated to $PA_NEW_VERSION"
+  return 3
+}
+
+# Becomes the agent now installed, in this very process, so the pid that procd
+# watches and the pid file names stays right. A function, so the tests can stand
+# in for it.
+pa_reexec() {
+  exec sh "$PA_BIN" run
+}
+
+# The owner's Update. The request is marked answered before anything else, so an
+# agent restarting halfway never takes it up twice. Re-executes into a new agent,
+# which reports the update itself. 0 answered, 1 Firebase could not be reached, 3
+# replaced (seen only in the tests, where re-executing comes back).
+pa_owner_update() {
+  pa_write_update UPDATING '' "$PA_UPD_REQ_RAW"
+  case $? in
+    1) return 1 ;;
+    # Refused: database rules older than this agent, so there is nowhere to say
+    # how it went. Nothing is done.
+    2) return 0 ;;
+  esac
+  pa_sync
+  case $? in
+    0)
+      PA_UPD_SAY=UP_TO_DATE
+      PA_UPD_SAY_DETAIL=$PA_AGENT_VERSION
+      ;;
+    3)
+      pa_reexec
+      return 3
+      ;;
+    *)
+      PA_UPD_SAY=FAILED
+      PA_UPD_SAY_DETAIL=$PA_SYNC_WHY
+      ;;
+  esac
+  PA_UPD_SAY_CLEAR=0
+  pa_update_say
+}
+
+# Writes what an update left to say (PA_UPD_SAY, PA_UPD_SAY_DETAIL), once. Kept for
+# the next contact when Firebase did not answer: 1 then.
+pa_update_say() {
+  [ -n "${PA_UPD_SAY:-}" ] || return 0
+  pa_write_update "$PA_UPD_SAY" "$PA_UPD_SAY_DETAIL"
+  [ $? = 1 ] && return 1
+  # A rollback's note is said once. A trial's file stays until the trial is over.
+  [ "${PA_UPD_SAY_CLEAR:-0}" = 1 ] && rm -f "$PA_BIN.trial"
+  PA_UPD_SAY=''
+  PA_UPD_SAY_CLEAR=0
+  return 0
+}
+
+# At start: whether this agent is fresh from an update, and on trial, or back after
+# one that failed. A trial's starts are counted, and one start too many brings back
+# the agent it replaced. Sets PA_TRIAL (with PA_TRIAL_FROM and PA_TRIAL_AT), and
+# what to tell the owner in PA_UPD_SAY.
+pa_trial_begin() {
+  PA_TRIAL=0
+  PA_UPD_SAY=''
+  PA_UPD_SAY_DETAIL=''
+  PA_UPD_SAY_CLEAR=0
+  [ -r "$PA_BIN.trial" ] || return 0
+  _tk=''
+  _tn=''
+  _tfrom=''
+  _tto=''
+  _twhy=''
+  { read -r _tk; read -r _tn; read -r _tfrom; read -r _tto; read -r _twhy; } < "$PA_BIN.trial"
+  if [ "$_tk" = rolledback ]; then
+    PA_UPD_SAY=FAILED
+    PA_UPD_SAY_DETAIL="$_tto $_twhy, so $_tfrom is back"
+    PA_UPD_SAY_CLEAR=1
+    return 0
+  fi
+  # Not a trial of this very agent: an update cut off before the swap.
+  if [ "$_tk" != trial ] || [ "$_tto" != "$PA_AGENT_VERSION" ]; then
+    rm -f "$PA_BIN.trial" "$PA_BIN.prev"
+    return 0
+  fi
+  pa_isnum "$_tn" || _tn=0
+  _tn=$((_tn + 1))
+  if [ "$_tn" -gt "$PA_TRIAL_STARTS" ]; then
+    pa_rollback "$_tfrom" "kept stopping"
+    return 0
+  fi
+  printf 'trial\n%s\n%s\n%s\n' "$_tn" "$_tfrom" "$_tto" > "$PA_BIN.trial"
+  PA_TRIAL=1
+  PA_TRIAL_FROM=$_tfrom
+  PA_TRIAL_AT=$PA_NOW
+  PA_UPD_SAY=UPDATED
+  PA_UPD_SAY_DETAIL="$_tfrom to $_tto"
+}
+
+# The new agent works: the one it replaced is no longer needed.
+pa_trial_pass() {
+  [ "${PA_TRIAL:-0}" = 1 ] || return 0
+  rm -f "$PA_BIN.trial" "$PA_BIN.prev"
+  PA_TRIAL=0
+  pa_log "agent $PA_AGENT_VERSION settled in"
+}
+
+# pa_rollback FROM WHY: the new agent did not make it. The one it replaced (FROM)
+# comes back, with a note for the owner, and takes over this process. With none
+# to go back to, this one carries on.
+pa_rollback() {
+  pa_log "agent $PA_AGENT_VERSION $2; going back to $1"
+  PA_TRIAL=0
+  if [ -f "$PA_BIN.prev" ] && mv -f "$PA_BIN.prev" "$PA_BIN"; then
+    printf 'rolledback\n0\n%s\n%s\n%s\n' "$1" "$PA_AGENT_VERSION" "$2" > "$PA_BIN.trial"
+    pa_reexec
+    return 0
+  fi
+  rm -f "$PA_BIN.trial"
+}
+
+# `protection-agent update`: the owner's Update, by hand in the router's shell.
+pa_update() {
+  pa_load_conf || pa_die "not enrolled. Run: protection-agent setup CODE PROJECT KEY"
+  [ -n "$PA_ROOT" ] || pa_is_root || pa_die "run this as the router's admin (root) user."
+  pa_http_client || pa_die "curl is missing. Run setup again to install it."
+  mkdir -p "$(dirname "$PA_TMP")"
+  pa_wall
+  pa_sync
+  case $? in
+    0) pa_say "Already up to date ($PA_AGENT_VERSION)." ;;
+    3)
+      pa_stop
+      pa_start || pa_die "updated to $PA_NEW_VERSION, but the service did not start."
+      pa_say "Updated the agent from $PA_AGENT_VERSION to $PA_NEW_VERSION."
+      ;;
+    *) pa_die "could not update: $PA_SYNC_WHY." ;;
+  esac
+}
+
 # -- Install and remove ---------------------------------------------------------------
 
 pa_install_self() {
@@ -2230,6 +2557,8 @@ pa_install_self() {
     cp "$_self" "$PA_BIN.new" && mv -f "$PA_BIN.new" "$PA_BIN" || return 1
   fi
   chmod 755 "$PA_BIN"
+  # Installed by hand: whatever an update had under way is over.
+  rm -f "$PA_BIN.prev" "$PA_BIN.trial" "$PA_BIN.trial.new"
 }
 
 pa_autostart_on() {
@@ -2392,7 +2721,7 @@ pa_uninstall() {
   rm -f "$PA_CONF" "$PA_TMP".*
   case $PA_PLATFORM in
     merlin) rm -rf "$PA_HOME" ;;
-    *) rm -f "$PA_BIN" ;;
+    *) rm -f "$PA_BIN" "$PA_BIN.new" "$PA_BIN.prev" "$PA_BIN.trial" "$PA_BIN.trial.new" ;;
   esac
   pa_say "Removed. Remove the router from the app too, if you have not already."
 }
@@ -2553,10 +2882,13 @@ pa_main() {
       ;;
     wifipos) pa_wifipos "$@" ;;
     doctor) pa_doctor ;;
+    update) pa_update ;;
     uninstall) pa_uninstall ;;
     version) pa_say "$PA_AGENT_VERSION" ;;
-    *) pa_die "unknown command '$_cmd'. Use setup, start, stop, status, report, wifipos, doctor or uninstall." ;;
+    *) pa_die "unknown command '$_cmd'. Use setup, start, stop, status, report, wifipos, doctor, update or uninstall." ;;
   esac
 }
 
+# Keep this the last line, and `version` printing PA_AGENT_VERSION alone: an
+# agent updating itself checks both on the agent it downloads.
 [ "${PA_SOURCED:-0}" = 1 ] || pa_main "$@"
