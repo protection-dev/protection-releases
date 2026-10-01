@@ -19,7 +19,7 @@
 # PA_SOURCED=1 loads the functions without running anything, and PA_FAKE_EPOCH
 # pins the wall clock.
 
-PA_AGENT_VERSION="1.2.0 (3)"
+PA_AGENT_VERSION="1.2.1 (4)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -69,8 +69,27 @@ PA_POSITION_SOURCE=IP_ADDRESS
 
 # -- Small helpers -----------------------------------------------------------------
 
+# Looks a program up on PATH by hand: some routers' BusyBox is built without the
+# `command` builtin (Asuswrt-Merlin on an RT-N18U), where `command -v` always fails.
+pa_which() {
+  pa_w_ifs=$IFS
+  IFS=:
+  for pa_w_dir in $PATH; do
+    if [ -n "$pa_w_dir" ] && [ -f "$pa_w_dir/$1" ] && [ -x "$pa_w_dir/$1" ]; then
+      IFS=$pa_w_ifs
+      printf '%s
+' "$pa_w_dir/$1"
+      return 0
+    fi
+  done
+  IFS=$pa_w_ifs
+  return 1
+}
+
+pa_have() { pa_which "$1" >/dev/null; }
+
 pa_log() {
-  if command -v logger >/dev/null 2>&1; then
+  if pa_have logger; then
     logger -t protection-agent "$*"
   fi
   [ "${PA_VERBOSE:-0}" = 1 ] && printf '%s\n' "$*" >&2
@@ -109,7 +128,7 @@ pa_clock() {
 pa_detect_platform() {
   if [ -f "$PA_ROOT/etc/openwrt_release" ]; then
     PA_PLATFORM=openwrt
-  elif command -v nvram >/dev/null 2>&1 && [ -d "$PA_ROOT/jffs" ]; then
+  elif pa_have nvram && [ -d "$PA_ROOT/jffs" ]; then
     PA_PLATFORM=merlin
   else
     PA_PLATFORM=unknown
@@ -230,9 +249,9 @@ pa_hardware_id() {
     _mac=$PA_V
   fi
   _mac=$(printf '%s' "$_mac" | tr 'A-F' 'a-f')
-  if command -v sha256sum >/dev/null 2>&1; then
+  if pa_have sha256sum; then
     PA_HW=$(printf 'protection-router:%s' "$_mac" | sha256sum)
-  elif command -v md5sum >/dev/null 2>&1; then
+  elif pa_have md5sum; then
     PA_HW=$(printf 'protection-router:%s' "$_mac" | md5sum)
   else
     PA_HW=$(printf '%s' "$_mac" | tr -d ':')
@@ -545,7 +564,7 @@ pa_uptime() {
 # @RADIO / @IF / @STA / @SURVEY lines, and the report's awk pass parses all of it.
 
 pa_wifi_openwrt() {
-  command -v iw >/dev/null 2>&1 || return 0
+  pa_have iw || return 0
   # AP interfaces, their SSID, channel and width, as @RADIO lines.
   iw dev 2>/dev/null | awk '
     function out() {
@@ -591,7 +610,7 @@ pa_chanspec() {
 }
 
 pa_wifi_merlin() {
-  command -v wl >/dev/null 2>&1 || return 0
+  pa_have wl || return 0
   for _u in 0 1 2 3; do
     pa_nv "wl${_u}_ifname"
     _if=$PA_V
@@ -654,7 +673,7 @@ pa_static_names() {
   : > "$PA_TMP.names"
   case $PA_PLATFORM in
     openwrt)
-      command -v uci >/dev/null 2>&1 || return 0
+      pa_have uci || return 0
       # dhcp.<section>.name='garage' and dhcp.<section>.mac='BC:07:...' (or a
       # space-separated list of MACs for one name).
       uci -q show dhcp 2>/dev/null | awk -F= '
@@ -1123,8 +1142,8 @@ pa_http_client() {
       return 0
     fi
   done
-  if command -v curl >/dev/null 2>&1; then
-    PA_CURL=$(command -v curl)
+  if pa_have curl; then
+    PA_CURL=$(pa_which curl)
     return 0
   fi
   return 1
@@ -1134,10 +1153,10 @@ pa_http_client() {
 pa_ensure_curl() {
   pa_http_client && return 0
   pa_say "Installing curl, which the agent uses to reach Firebase..."
-  if command -v apk >/dev/null 2>&1; then
+  if pa_have apk; then
     apk update >/dev/null 2>&1
     apk add curl >/dev/null 2>&1
-  elif command -v opkg >/dev/null 2>&1; then
+  elif pa_have opkg; then
     opkg update >/dev/null 2>&1
     opkg install curl >/dev/null 2>&1
   fi
@@ -1676,14 +1695,14 @@ pa_start() {
   mkdir -p "$(dirname "$PA_TMP")"
   # Detached from the SSH session that started it: its own session where BusyBox
   # has setsid, immune to hangup otherwise.
-  if command -v setsid >/dev/null 2>&1; then
+  if pa_have setsid; then
     setsid sh "$PA_BIN" run < /dev/null > /dev/null 2>&1 &
-  elif command -v nohup >/dev/null 2>&1; then
+  elif pa_have nohup; then
     nohup sh "$PA_BIN" run < /dev/null > /dev/null 2>&1 &
   else
     sh "$PA_BIN" run < /dev/null > /dev/null 2>&1 &
   fi
-  if [ "$PA_PLATFORM" = merlin ] && command -v cru >/dev/null 2>&1; then
+  if [ "$PA_PLATFORM" = merlin ] && pa_have cru; then
     # A watchdog: `start` is a no-op while the agent runs, and restarts it if not.
     cru l 2>/dev/null | grep -q "#protection-agent#" \
       || cru a protection-agent "*/10 * * * * $PA_BIN start"
@@ -1769,7 +1788,7 @@ pa_autostart_off() {
     merlin)
       _ss="$PA_ROOT/jffs/scripts/services-start"
       [ -f "$_ss" ] && sed -i "/$PA_MARK/d" "$_ss"
-      command -v cru >/dev/null 2>&1 && cru d protection-agent 2>/dev/null
+      pa_have cru && cru d protection-agent 2>/dev/null
       ;;
     openwrt)
       pa_initd disable 2>/dev/null

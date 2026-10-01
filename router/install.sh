@@ -39,12 +39,27 @@ esac
 TMP=/tmp/protection-agent.install.$$
 trap 'rm -f "$TMP"' EXIT INT TERM
 
+# Looks a program up on PATH by hand: some routers' BusyBox is built without the
+# `command` builtin (Asuswrt-Merlin on an RT-N18U), where `command -v` always fails.
+have() {
+  have_ifs=$IFS
+  IFS=:
+  for have_dir in $PATH; do
+    if [ -n "$have_dir" ] && [ -f "$have_dir/$1" ] && [ -x "$have_dir/$1" ]; then
+      IFS=$have_ifs
+      return 0
+    fi
+  done
+  IFS=$have_ifs
+  return 1
+}
+
 fetch() {
-  if command -v curl >/dev/null 2>&1; then
+  if have curl; then
     curl -fsSL --connect-timeout 10 --max-time 90 -o "$2" "$1"
-  elif command -v uclient-fetch >/dev/null 2>&1; then
+  elif have uclient-fetch; then
     uclient-fetch -q -T 90 -O "$2" "$1"
-  elif command -v wget >/dev/null 2>&1; then
+  elif have wget; then
     wget -q -T 90 -O "$2" "$1"
   else
     echo "No curl, uclient-fetch or wget on this router." >&2
