@@ -4,8 +4,9 @@
 #
 #   protection-agent setup CODE PROJECT KEY   install, enrol with a pairing code, start
 #   protection-agent start | stop             the background service
-#   protection-agent status                   enrolment and service state
+#   protection-agent status                   enrolment, service and positioning state
 #   protection-agent report                   print the report it would write (nothing sent)
+#   protection-agent wifipos off | on         stop (or resume) Wi-Fi positioning
 #   protection-agent uninstall                stop and remove everything it installed
 #
 # Written for BusyBox ash and BusyBox awk: POSIX only, no bashisms. It sleeps
@@ -16,10 +17,10 @@
 # settings. It needs curl, which setup installs on OpenWrt when it is missing.
 #
 # Test hooks: PA_ROOT prefixes every filesystem path it reads or writes,
-# PA_SOURCED=1 loads the functions without running anything, and PA_FAKE_EPOCH
-# pins the wall clock.
+# PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
+# the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.2.1 (4)"
+PA_AGENT_VERSION="1.3.0 (5)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -60,12 +61,30 @@ PA_AUTH_URL="${PA_AUTH_URL:-https://identitytoolkit.googleapis.com/v1/accounts:s
 PA_TOKEN_URL="${PA_TOKEN_URL:-https://securetoken.googleapis.com/v1/token}"
 PA_FS_URL="${PA_FS_URL:-https://firestore.googleapis.com/v1}"
 PA_IPINFO_URL="${PA_IPINFO_URL:-https://ipinfo.io/json}"
-# A router's only fix is the city-level one its public IP gives, so the map shows
-# an area, not a false point: the coordinates ride the device's own location
-# fields with this radius as the accuracy, and the owner clients draw the disc.
-# Mirrors TrackingConfig.ROUTER_IP_AREA_RADIUS_M and PositionSource.IP_ADDRESS.
+PA_GEO_URL="${PA_GEO_URL:-https://api.beacondb.net/v1/geolocate}"
+# A router has no GPS. Its position rides the device's own location fields, from
+# the best source it has:
+#   1. where the owner pinned it (pinnedLatitude/pinnedLongitude on its document,
+#      read on every contact): exact, and always wins;
+#   2. Wi-Fi positioning: the networks around it, through beaconDB (free, no key,
+#      the community successor to Mozilla's location service), tens of metres where
+#      beaconDB knows the neighbourhood;
+#   3. the city its public IP places it in, drawn as an area this wide rather than
+#      as a false point. Mirrors TrackingConfig.ROUTER_IP_AREA_RADIUS_M.
 PA_IP_AREA_RADIUS_M="${PA_IP_AREA_RADIUS_M:-25000}"
-PA_POSITION_SOURCE=IP_ADDRESS
+# A pin set without an accuracy (a point dropped on the map, pasted coordinates).
+PA_PIN_ACCURACY_M=10
+# A router does not move, so a Wi-Fi fix is kept six hours (or until the WAN address
+# changes); a failed attempt is not retried for an hour, so a quiet neighbourhood
+# costs one scan and one call an hour at most. The scan answers in a few seconds; at
+# most this many of the strongest networks are sent. An answer vaguer than
+# PA_GEO_MAX_ACC is not a Wi-Fi fix (a lookup service can fall back to placing the
+# caller by IP) and is not used.
+PA_GEO_MAX_AGE=21600
+PA_GEO_RETRY=3600
+PA_GEO_MAX_APS=20
+PA_GEO_MAX_ACC=1000
+PA_SCAN_WAIT="${PA_SCAN_WAIT:-4}"
 
 # -- Small helpers -----------------------------------------------------------------
 
@@ -1040,6 +1059,193 @@ pa_ipinfo() {
     "$PA_LAT" "$PA_LON" > "$_cache"
 }
 
+# Coordinates fit to send: both decimal, and in range. Firestore's rules refuse a
+# whole report whose latitude or longitude is out of range, so one bad value would
+# cost the router every other figure too.
+pa_valid_position() {
+  pa_is_coord "$1" && pa_is_coord "$2" || return 1
+  awk -v a="$1" -v o="$2" 'BEGIN { exit !(a + 0 >= -90 && a + 0 <= 90 && o + 0 >= -180 && o + 0 <= 180) }'
+}
+
+# -- Wi-Fi positioning ------------------------------------------------------------
+# The networks around the router, as "mac signal" lines, for a geolocation service
+# to turn into a position the way a phone's Wi-Fi positioning does. Each
+# platform scans one radio, the 2.4 GHz one (it hears the most neighbours), and
+# prints "mac signal ssid" lines for pa_scan_filter.
+
+# Keeps the networks a position can be built on, as "mac signal", strongest first,
+# each once, at most PA_GEO_MAX_APS: a well-formed address and signal; not one that
+# asked not to be mapped (an SSID ending in _nomap or _optout); not a locally
+# administered address (a phone's hotspot or a randomised one), which moves about
+# and would drag the fix with it.
+pa_scan_filter() {
+  awk '
+    {
+      mac = tolower($1)
+      if (mac !~ /^[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]$/) next
+      if (substr(mac, 2, 1) ~ /[26ae]/) next
+      sig = $2
+      sub(/\..*/, "", sig)
+      if (sig !~ /^-[0-9]+$/) next
+      s = $0
+      sub(/^[^ ]+ [^ ]* ?/, "", s)
+      if (tolower(s) ~ /_(nomap|optout)$/) next
+      if (seen[mac]++) next
+      print mac, sig
+    }
+  ' | sort -t ' ' -k2,2nr | head -n "$PA_GEO_MAX_APS"
+}
+
+pa_wifi_scan_openwrt() {
+  pa_have iw || return 0
+  # The first 2.4 GHz AP interface, else the first AP interface of any band.
+  _gif=$(iw dev 2>/dev/null | awk '
+    /^[ \t]*Interface / { name = $2; type = ""; next }
+    /^[ \t]*type / { type = $2; next }
+    /^[ \t]*channel / {
+      if (type != "AP") next
+      f = $3
+      gsub(/[^0-9]/, "", f)
+      if (any == "") any = name
+      if (f + 0 < 3000 && pick == "") pick = name
+      next
+    }
+    END { print (pick != "" ? pick : any) }
+  ')
+  [ -n "$_gif" ] || return 0
+  # mac80211 drivers refuse a scan from an AP interface unless it is forced.
+  { iw dev "$_gif" scan ap-force 2>/dev/null || iw dev "$_gif" scan 2>/dev/null; } | awk '
+    function out() {
+      if (mac != "") printf "%s %s %s\n", mac, sig, ssid
+      mac = ""
+      sig = ""
+      ssid = ""
+    }
+    /^BSS / { out(); mac = $2; sub(/\(.*/, "", mac); next }
+    /^[ \t]*signal:/ { sig = $2; next }
+    /^[ \t]*SSID:/ { s = $0; sub(/^[ \t]*SSID:[ \t]?/, "", s); ssid = s; next }
+    END { out() }
+  ' | pa_scan_filter
+}
+
+pa_wifi_scan_merlin() {
+  pa_have wl || return 0
+  _gif=''
+  for _gu in 0 1 2 3; do
+    pa_nv "wl${_gu}_nband"
+    [ "$PA_V" = 2 ] || continue
+    pa_nv "wl${_gu}_radio"
+    [ "$PA_V" = 0 ] && continue
+    pa_nv "wl${_gu}_ifname"
+    _gif=$PA_V
+    [ -n "$_gif" ] && break
+  done
+  [ -n "$_gif" ] || return 0
+  # `wl scan` starts the scan and returns; the results are read once it is done.
+  wl -i "$_gif" scan > /dev/null 2>&1
+  sleep "$PA_SCAN_WAIT"
+  wl -i "$_gif" scanresults 2>/dev/null | awk '
+    /^SSID:/ { s = $0; sub(/^SSID:[ \t]*"?/, "", s); sub(/"[ \t]*$/, "", s); ssid = s; sig = ""; next }
+    /RSSI:/ { v = $0; sub(/.*RSSI:[ \t]*/, "", v); sub(/[^-0-9].*/, "", v); sig = v; next }
+    /^BSSID:/ { printf "%s %s %s\n", $2, sig, ssid; ssid = ""; sig = ""; next }
+  ' | pa_scan_filter
+}
+
+pa_wifi_scan() {
+  : > "$PA_TMP.scan"
+  case $PA_PLATFORM in
+    openwrt) pa_wifi_scan_openwrt > "$PA_TMP.scan" ;;
+    merlin) pa_wifi_scan_merlin > "$PA_TMP.scan" ;;
+  esac
+}
+
+# The router's position from the networks around it, through beaconDB's geolocate
+# API: the Mozilla Location Service request format, free and keyless. On unless the
+# owner switched it off (`wifipos off`). Cached in RAM: located again after
+# PA_GEO_MAX_AGE or when the WAN address changes, and after a failure not tried
+# again for PA_GEO_RETRY. Sets PA_GEO_LAT, PA_GEO_LON and PA_GEO_ACC (empty without
+# a fix) and PA_GEO_NOTE, the last outcome: ok; few (fewer than two usable networks
+# around); nofix (beaconDB does not know them); coarse (only a rough answer, vaguer
+# than PA_GEO_MAX_ACC); http-CODE; unreachable. Empty when off or not tried yet.
+pa_wifigeo() {
+  PA_GEO_LAT=''
+  PA_GEO_LON=''
+  PA_GEO_ACC=''
+  PA_GEO_NOTE=''
+  [ "${PA_WIFIPOS:-on}" = off ] && return 0
+  # A pinned router knows where it is: no scan, and nothing about its neighbours sent.
+  pa_valid_position "${PA_PIN_LAT:-}" "${PA_PIN_LON:-}" && return 0
+  _gcache="$PA_TMP.wifigeo"
+  if [ -r "$_gcache" ]; then
+    {
+      read -r _gat
+      read -r _gfor
+      read -r PA_GEO_NOTE
+      read -r PA_GEO_LAT
+      read -r PA_GEO_LON
+      read -r PA_GEO_ACC
+    } < "$_gcache"
+    _gttl=$PA_GEO_RETRY
+    [ "$PA_GEO_NOTE" = ok ] && _gttl=$PA_GEO_MAX_AGE
+    if pa_isnum "$_gat" && [ "$_gfor" = "${PA_WAN_IP:-}" ] && [ $((PA_NOW - _gat)) -ge 0 ] &&
+      [ $((PA_NOW - _gat)) -lt "$_gttl" ]; then
+      return 0
+    fi
+  fi
+  PA_GEO_LAT=''
+  PA_GEO_LON=''
+  PA_GEO_ACC=''
+  # A dry run reports what is cached; it never scans or calls out.
+  [ "${PA_DRY:-0}" = 1 ] && return 0
+  [ -n "${PA_CURL:-}" ] || return 0
+  pa_wifi_scan
+  _gn=$(wc -l < "$PA_TMP.scan" 2>/dev/null)
+  _gn=$((${_gn:-0} + 0))
+  if [ "$_gn" -lt 2 ]; then
+    PA_GEO_NOTE=few
+  else
+    awk '
+      BEGIN { printf "{\"considerIp\":false,\"wifiAccessPoints\":[" }
+      { printf "%s{\"macAddress\":\"%s\",\"signalStrength\":%s}", (NR > 1 ? "," : ""), $1, $2 }
+      END { printf "]}\n" }
+    ' "$PA_TMP.scan" > "$PA_TMP.geo.req"
+    # Who is asking, as a public service may want to know. Nothing secret in it.
+    printf 'User-Agent: protection-agent/%s\n' "${PA_AGENT_VERSION%% *}" > "$PA_TMP.geo.hdr"
+    if ! pa_http POST "$PA_GEO_URL" "$PA_TMP.geo.req" application/json "$PA_TMP.geo.hdr"; then
+      PA_GEO_NOTE=unreachable
+    else
+      case $PA_STATUS in
+        200)
+          pa_compact
+          _glat=${PA_J#*\"lat\":}
+          _glat=${_glat%%[,\}]*}
+          _glon=${PA_J#*\"lng\":}
+          _glon=${_glon%%[,\}]*}
+          _gacc=${PA_J#*\"accuracy\":}
+          _gacc=${_gacc%%[,\}]*}
+          PA_GEO_NOTE=nofix
+          if pa_valid_position "$_glat" "$_glon" && pa_is_coord "$_gacc"; then
+            if awk -v a="$_gacc" -v m="$PA_GEO_MAX_ACC" 'BEGIN { exit !(a + 0 > 0 && a + 0 <= m + 0) }'; then
+              PA_GEO_LAT=$_glat
+              PA_GEO_LON=$_glon
+              PA_GEO_ACC=$_gacc
+              PA_GEO_NOTE=ok
+            else
+              PA_GEO_NOTE=coarse
+            fi
+          fi
+          ;;
+        404) PA_GEO_NOTE=nofix ;;
+        *) PA_GEO_NOTE="http-$PA_STATUS" ;;
+      esac
+    fi
+    rm -f "$PA_TMP.geo.req" "$PA_TMP.geo.hdr"
+  fi
+  rm -f "$PA_TMP.scan"
+  printf '%s\n' "$PA_NOW" "${PA_WAN_IP:-}" "$PA_GEO_NOTE" "$PA_GEO_LAT" "$PA_GEO_LON" "$PA_GEO_ACC" > "$_gcache"
+  [ "$PA_GEO_NOTE" = ok ] || pa_log "Wi-Fi positioning: $PA_GEO_NOTE"
+}
+
 # Collects everything and prints the Firestore write for a full report. PA_FULFIL=1
 # also marks an owner Refresh answered.
 pa_build_report() {
@@ -1057,6 +1263,7 @@ pa_build_report() {
   pa_wifi
   pa_wall
   pa_ipinfo
+  pa_wifigeo
   _nowms=$((PA_WALL * 1000))
   _booted=''
   [ -n "${PA_UP:-}" ] && _booted=$(((PA_WALL - PA_UP) * 1000))
@@ -1090,19 +1297,45 @@ pa_build_report() {
   [ -r "$_prev" ] || _prev=/dev/null
   _hist="$PA_TMP.history"
   [ -r "$_hist" ] || _hist=/dev/null
-  # The device-level position fields ride this report only when the IP lookup gave
-  # real coordinates. The flag keeps pa_write_report's updateMask in step, so a
-  # report without a position never deletes a good one already on the document;
-  # awk's own fdbl guard uses the same test on the same values, so the two agree.
+  # The position, best source first: the owner's pin (exact, and always wins), the
+  # Wi-Fi fix (tens of metres), else the city the IP lookup gave, as a
+  # PA_IP_AREA_RADIUS_M area. The flag keeps pa_write_report's updateMask in step,
+  # so a report without a position never deletes a good one already on the
+  # document; awk's fdbl guard emits exactly the coordinates chosen here, so the
+  # two agree.
+  _plat=''
+  _plon=''
+  _pacc=''
+  _psrc=''
+  if pa_valid_position "${PA_PIN_LAT:-}" "${PA_PIN_LON:-}"; then
+    _plat=$PA_PIN_LAT
+    _plon=$PA_PIN_LON
+    _pacc=$PA_PIN_ACCURACY_M
+    if pa_is_coord "${PA_PIN_ACC:-}" && awk -v a="$PA_PIN_ACC" 'BEGIN { exit !(a + 0 > 0) }'; then
+      _pacc=$PA_PIN_ACC
+    fi
+    # PositionSource.DEFAULT: coordinates a person set, not a fix.
+    _psrc=DEFAULT
+  elif pa_valid_position "${PA_GEO_LAT:-}" "${PA_GEO_LON:-}" && pa_is_coord "${PA_GEO_ACC:-}"; then
+    _plat=$PA_GEO_LAT
+    _plon=$PA_GEO_LON
+    _pacc=$PA_GEO_ACC
+    _psrc=WIFI
+  elif pa_valid_position "${PA_LAT:-}" "${PA_LON:-}"; then
+    _plat=$PA_LAT
+    _plon=$PA_LON
+    _pacc=$PA_IP_AREA_RADIUS_M
+    _psrc=IP_ADDRESS
+  fi
   PA_HAS_POSITION=0
-  if pa_is_coord "${PA_LAT:-}" && pa_is_coord "${PA_LON:-}"; then PA_HAS_POSITION=1; fi
+  [ -n "$_plat" ] && PA_HAS_POSITION=1
   rm -f "$PA_TMP.history.added"
   PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FULFIL=${PA_FULFIL:-0} \
     PJ_BOOTED=$_booted PJ_CPU=${PA_CPU:-} PJ_MU=${PA_MEM_USED:-} PJ_MT=${PA_MEM_TOTAL:-} \
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
     PJ_RX=${PA_RX_BPS:-} PJ_TX=${PA_TX_BPS:-} PJ_HRX=${PA_HRX_BPS:-} PJ_HTX=${PA_HTX_BPS:-} \
-    PJ_LAT=${PA_LAT:-} PJ_LON=${PA_LON:-} PJ_ACC=$PA_IP_AREA_RADIUS_M PJ_PSRC=$PA_POSITION_SOURCE \
+    PJ_LAT=$_plat PJ_LON=$_plon PJ_ACC=$_pacc PJ_PSRC=$_psrc \
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
       -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
@@ -1165,8 +1398,9 @@ pa_ensure_curl() {
 
 # pa_http METHOD URL BODYFILE CONTENT-TYPE AUTH: the response body lands in
 # $PA_TMP.resp and its status in PA_STATUS. AUTH=1 sends the Firebase ID token,
-# from a file so it never shows in the process list. 0 when any HTTP answer came
-# back, 1 when none did.
+# from a file so it never shows in the process list; an absolute path sends the
+# header in that file instead (the beaconDB User-Agent). 0 when any HTTP answer
+# came back, 1 when none did.
 #
 # If the router's own resolver fails (NextDNS or AdGuard restarting, Tailscale's
 # MagicDNS unreachable, dnsmasq not up yet at boot), curl retries once over DNS-over-
@@ -1179,7 +1413,10 @@ pa_http() {
   _auth=$5
   rm -f "$PA_TMP.resp"
   set -- -gsS --connect-timeout 10 --max-time 30 -X "$_m" -o "$PA_TMP.resp" -w '%{http_code}'
-  if [ "$_auth" = 1 ] && [ -r "$PA_TMP.auth" ]; then set -- "$@" -H "@$PA_TMP.auth"; fi
+  case $_auth in
+    1) [ -r "$PA_TMP.auth" ] && set -- "$@" -H "@$PA_TMP.auth" ;;
+    /*) [ -r "$_auth" ] && set -- "$@" -H "@$_auth" ;;
+  esac
   if [ -n "$_b" ]; then set -- "$@" -H "Content-Type: $_ct" --data-binary "@$_b"; fi
   PA_STATUS=$("$PA_CURL" "$@" "$_u" 2>/dev/null)
   _rc=$?
@@ -1314,7 +1551,10 @@ pa_poll() {
   PA_REQ=''
   PA_DONE=''
   PA_ACTIVE=''
-  pa_http GET "$PA_DEVICE_URL?mask.fieldPaths=enrollmentStatus&mask.fieldPaths=locationRequestedAt&mask.fieldPaths=locationRequestFulfilledAt&mask.fieldPaths=ownerActiveAt" '' '' 1 || return 1
+  PA_PIN_LAT=''
+  PA_PIN_LON=''
+  PA_PIN_ACC=''
+  pa_http GET "$PA_DEVICE_URL?mask.fieldPaths=enrollmentStatus&mask.fieldPaths=locationRequestedAt&mask.fieldPaths=locationRequestFulfilledAt&mask.fieldPaths=ownerActiveAt&mask.fieldPaths=pinnedLatitude&mask.fieldPaths=pinnedLongitude&mask.fieldPaths=pinnedAccuracyMeters" '' '' 1 || return 1
   case $PA_STATUS in
     200) ;;
     401)
@@ -1333,6 +1573,10 @@ pa_poll() {
   pa_fsval _v locationRequestedAt && pa_epoch PA_REQ "$_v"
   pa_fsval _v locationRequestFulfilledAt && pa_epoch PA_DONE "$_v"
   pa_fsval _v ownerActiveAt && pa_epoch PA_ACTIVE "$_v"
+  # Where the owner pinned the router, if anywhere: its position from here on.
+  pa_fsval PA_PIN_LAT pinnedLatitude
+  pa_fsval PA_PIN_LON pinnedLongitude
+  pa_fsval PA_PIN_ACC pinnedAccuracyMeters
   return 0
 }
 
@@ -1389,6 +1633,7 @@ pa_load_conf() {
   PA_GROUP=''
   PA_UID=''
   PA_REFRESH=''
+  PA_WIFIPOS=''
   [ -r "$PA_CONF" ] || return 1
   while IFS='=' read -r _k _v; do
     _v=${_v#\'}
@@ -1399,6 +1644,8 @@ pa_load_conf() {
       PA_GROUP) PA_GROUP=$_v ;;
       PA_UID) PA_UID=$_v ;;
       PA_REFRESH) PA_REFRESH=$_v ;;
+      # Optional: "off" when the owner turned Wi-Fi positioning off.
+      PA_WIFIPOS) [ "$_v" = off ] && PA_WIFIPOS=off ;;
     esac
   done < "$PA_CONF"
   pa_valid_project "$PA_PROJECT" && pa_valid_key "$PA_KEY" && pa_valid_id "$PA_GROUP" &&
@@ -1417,6 +1664,7 @@ pa_save_conf() {
       printf "PA_GROUP='%s'\n" "$PA_GROUP"
       printf "PA_UID='%s'\n" "$PA_UID"
       printf "PA_REFRESH='%s'\n" "$PA_REFRESH"
+      printf "PA_WIFIPOS='%s'\n" "${PA_WIFIPOS:-}"
     } > "$PA_CONF.tmp"
   ) || return 1
   chmod 600 "$PA_CONF.tmp" 2>/dev/null
@@ -1843,6 +2091,30 @@ pa_setup() {
   fi
 }
 
+# Turns Wi-Fi positioning off on a router (it is then placed by its pin, or else by
+# its public IP, and never scans or calls out for it), or back on. Restarts the
+# service so the next report uses the new setting. The file is written with the
+# service stopped, so a token rotation in the running agent can't write its old
+# copy over it.
+pa_wifipos() {
+  pa_load_conf || pa_die "not enrolled. Run: protection-agent setup CODE PROJECT KEY"
+  case ${1:-} in
+    on) _gwp='' ;;
+    off) _gwp=off ;;
+    *) pa_die "usage: protection-agent wifipos off | on" ;;
+  esac
+  pa_stop
+  PA_WIFIPOS=$_gwp
+  pa_save_conf || pa_die "could not write $PA_CONF."
+  rm -f "$PA_TMP.wifigeo"
+  pa_start || pa_die "saved, but the service did not start."
+  if [ "$_gwp" = off ]; then
+    pa_say "Wi-Fi positioning is off: the router is placed by its pin, or else by its public IP."
+  else
+    pa_say "Wi-Fi positioning is on: the next report locates the router from the networks around it."
+  fi
+}
+
 pa_uninstall() {
   pa_stop
   pa_autostart_off
@@ -1863,6 +2135,27 @@ pa_status() {
   pa_say "Device: $PA_UID (group $PA_GROUP)"
   if pa_running_pid; then pa_say "Service: running (pid $PA_PID)"; else pa_say "Service: stopped"; fi
   if pa_check; then pa_say "Enrolment: $PA_S"; else pa_say "Enrolment: Firebase unreachable"; fi
+  _gfall="placed by public IP"
+  if pa_valid_position "${PA_PIN_LAT:-}" "${PA_PIN_LON:-}"; then
+    pa_say "Position: pinned by the owner at $PA_PIN_LAT, $PA_PIN_LON (wins over Wi-Fi and IP)"
+    _gfall="placed by its pin"
+  fi
+  if [ "${PA_WIFIPOS:-on}" = off ]; then
+    pa_say "Wi-Fi positioning: off (turn on with: $PA_BIN wifipos on)"
+    return 0
+  fi
+  _gnote=''
+  _gacc=''
+  [ -r "$PA_TMP.wifigeo" ] && { read -r _ga; read -r _gf; read -r _gnote; read -r _gl; read -r _go; read -r _gacc; } < "$PA_TMP.wifigeo"
+  case $_gnote in
+    ok) pa_say "Wi-Fi positioning: on, located to within ${_gacc%%.*} m" ;;
+    few) pa_say "Wi-Fi positioning: on, but too few Wi-Fi networks nearby ($_gfall)" ;;
+    nofix) pa_say "Wi-Fi positioning: on, but beaconDB doesn't know the networks nearby yet ($_gfall)" ;;
+    coarse) pa_say "Wi-Fi positioning: on, but beaconDB only gave a rough position ($_gfall)" ;;
+    unreachable) pa_say "Wi-Fi positioning: on, but beaconDB was unreachable ($_gfall)" ;;
+    '') pa_say "Wi-Fi positioning: on, not located yet" ;;
+    *) pa_say "Wi-Fi positioning: on, last attempt failed: $_gnote ($_gfall)" ;;
+  esac
 }
 
 pa_main() {
@@ -1890,9 +2183,10 @@ pa_main() {
       pa_build_report
       rm -f "$PA_TMP.history.new"
       ;;
+    wifipos) pa_wifipos "$@" ;;
     uninstall) pa_uninstall ;;
     version) pa_say "$PA_AGENT_VERSION" ;;
-    *) pa_die "unknown command '$_cmd'. Use setup, start, stop, status, report or uninstall." ;;
+    *) pa_die "unknown command '$_cmd'. Use setup, start, stop, status, report, wifipos or uninstall." ;;
   esac
 }
 
