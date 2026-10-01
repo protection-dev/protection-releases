@@ -20,7 +20,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.3.1 (6)"
+PA_AGENT_VERSION="1.3.2 (7)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -96,8 +96,7 @@ pa_which() {
   for pa_w_dir in $PATH; do
     if [ -n "$pa_w_dir" ] && [ -f "$pa_w_dir/$1" ] && [ -x "$pa_w_dir/$1" ]; then
       IFS=$pa_w_ifs
-      printf '%s
-' "$pa_w_dir/$1"
+      printf '%s\n' "$pa_w_dir/$1"
       return 0
     fi
   done
@@ -788,7 +787,7 @@ PA_AWK_REPORT='
 function fstr(s) { return (s == "") ? "" : "{\"stringValue\":\"" esc(s) "\"}" }
 function fint(n) { return (n ~ /^-?[0-9]+$/) ? "{\"integerValue\":\"" n "\"}" : "" }
 function fdbl(n) { return (n ~ /^-?[0-9]+(\.[0-9]+)?$/) ? "{\"doubleValue\":" n "}" : "" }
-function put(acc, name, v) { if (v == "") return acc; return acc (acc == "" ? "" : ",") "\"" name "\":" v }
+function put(acc, name, v) { if (v == "") return acc; if (acc != "") acc = acc ","; return acc "\"" name "\":" v }
 function fmap(fields) { return "{\"mapValue\":{\"fields\":{" fields "}}}" }
 function farr(values) { return (values == "") ? "{\"arrayValue\":{}}" : "{\"arrayValue\":{\"values\":[" values "]}}" }
 function ms(x) { return sprintf("%.0f", x) }
@@ -897,7 +896,8 @@ END {
     x = put(x, "widthMhz", fint(rw[i]))
     x = put(x, "utilizationPercent", fint(util))
     x = put(x, "clientCount", fint((r in rcount) ? rcount[r] : 0))
-    radios = radios (radios == "" ? "" : ",") fmap(x)
+    if (radios != "") radios = radios ","
+    radios = radios fmap(x)
   }
   close(surveyout)
 
@@ -911,7 +911,8 @@ END {
     x = put(x, "band", fstr(bandname((m in wband) ? wband[m] : "")))
     x = put(x, "signalDbm", fint(wsig[m]))
     if (wct[m] ~ /^[0-9]+$/) x = put(x, "connectedSince", fint(ms(now - wct[m] * 1000)))
-    clients = clients (shown ? "," : "") fmap(x)
+    if (shown) clients = clients ","
+    clients = clients fmap(x)
     shown++
   }
 
@@ -937,7 +938,8 @@ END {
     x = put(x, "at", fint(kat[i]))
     x = put(x, "rx", fint(krx[i]))
     x = put(x, "tx", fint(ktx[i]))
-    hist = hist (hist == "" ? "" : ",") fmap(x)
+    if (hist != "") hist = hist ","
+    hist = hist fmap(x)
   }
   close(histout)
 
