@@ -20,7 +20,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.3.3 (8)"
+PA_AGENT_VERSION="1.4.0 (9)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -810,11 +810,23 @@ function flush() {
   if (cur != "" && macok(cur)) {
     sig = (savg != "") ? savg : ((ssig != "") ? ssig : santa)
     wband[cur] = curband; wsig[cur] = sig; wct[cur] = sct
+    if (sdn ~ /^[0-9]+$/ && sup ~ /^[0-9]+$/) { wdn[cur] = sdn; wup[cur] = sup }
+    wld[cur] = sld; wlu[cur] = slu
     remember(cur)
     if (!(cur in counted)) { counted[cur] = 1; rcount[curparent]++ }
   }
-  cur = ""; savg = ""; ssig = ""; sct = ""; santa = ""
+  cur = ""; savg = ""; ssig = ""; sct = ""; santa = ""; sdn = ""; sup = ""; sld = ""; slu = ""
 }
+# Bytes a station moved since the previous report, from two readings of a counter
+# that starts again at 0 when it reconnects. A smaller reading while it stayed
+# connected is a 32-bit counter that wrapped (old Broadcom drivers); otherwise it
+# reconnected, and everything since then counts.
+function grew(now, before, ct, pct) {
+  if (now + 0 >= before + 0) return now - before
+  if (ct ~ /^[0-9]+$/ && pct ~ /^[0-9]+$/ && ct + 0 >= pct + 0 && before + 0 >= 2147483648 && before + 0 < 4294967296) return now + 4294967296 - before
+  return now + 0
+}
+function mbps(v) { return (v + 0 > 0) ? sprintf("%.0f", v + 0) : "" }
 FILENAME == leases {
   m = tolower($2)
   if (macok(m)) { lip[m] = $3; if ($4 != "*" && $4 != "") lname[m] = $4 }
@@ -835,6 +847,18 @@ FILENAME == arp {
 }
 FILENAME == prevsurvey {
   pact[$1] = $2; pbusy[$1] = $3
+  next
+}
+FILENAME == prevsta {
+  # "@ SECONDS": when the previous report read the stations, even if none were there.
+  if ($1 == "@" && $2 ~ /^[0-9]+$/) lastat = $2 + 0
+  else if (macok($1) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/) {
+    pdn[$1] = $2; pup[$1] = $3; pct[$1] = $4; pat[$1] = $5
+  }
+  next
+}
+FILENAME == usage {
+  if ($1 ~ /^[0-9]+$/ && macok($2) && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/) { k = $1 " " $2; udn[k] += $3; uup[k] += $4 }
   next
 }
 FILENAME == history {
@@ -865,8 +889,17 @@ FILENAME == wifi {
     if ($1 == "signal" && $2 == "avg:") savg = $3
     else if ($1 == "signal:") ssig = $2
     else if ($1 == "connected" && $2 == "time:") sct = $3
+    # From the router side: what it sent the device is what the device downloaded.
+    else if ($1 == "tx" && $2 == "bytes:") sdn = $3
+    else if ($1 == "rx" && $2 == "bytes:") sup = $3
+    else if ($1 == "tx" && $2 == "bitrate:") sld = $3
+    else if ($1 == "rx" && $2 == "bitrate:") slu = $3
   } else if (mode == "wl") {
     if ($1 == "in" && $2 == "network") sct = $3
+    else if ($1 == "tx" && $2 == "total" && $3 == "bytes:") sdn = $4
+    else if ($1 == "rx" && $2 == "data" && $3 == "bytes:") sup = $4
+    else if ($0 ~ /rate of last tx pkt:/) { v = $0; sub(/.*pkt:[ \t]*/, "", v); sld = (v + 0) / 1000 }
+    else if ($0 ~ /rate of last rx pkt:/) { v = $0; sub(/.*pkt:[ \t]*/, "", v); slu = (v + 0) / 1000 }
     else if ($0 ~ /smoothed rssi:/) { v = $0; sub(/.*smoothed rssi:[ \t]*/, "", v); savg = v + 0 }
     else if ($0 ~ /per antenna average rssi of rx data frames:/) {
       v = $0; sub(/.*frames:[ \t]*/, "", v); c = split(v, a, " "); t = 0; q = 0
@@ -901,6 +934,37 @@ END {
   }
   close(surveyout)
 
+  # Data each Wi-Fi device used: what its counters grew by since the previous
+  # report goes into the bucket for this hour, and the last 24 hourly buckets are kept
+  # (in RAM, like the history). A device first seen after the previous report
+  # joined since, so all of its counter counts; one already connected when the
+  # counting began only counts from here. Every device, not only the ones listed.
+  nows = int(now / 1000); hour = int(nows / 3600)
+  printf("@ %s\n", nows) > staout
+  for (i = 1; i <= n; i++) {
+    m = order[i]
+    if (!(m in wdn)) continue
+    dd = 0; du = 0
+    if (m in pdn) {
+      dd = grew(wdn[m], pdn[m], wct[m], pct[m]); du = grew(wup[m], pup[m], wct[m], pct[m])
+      dt = nows - pat[m]
+      if (dt > 0 && dt <= 3600) { rdn[m] = sprintf("%.0f", dd * 8 / dt); rup[m] = sprintf("%.0f", du * 8 / dt) }
+    } else if (lastat > 0 && wct[m] ~ /^[0-9]+$/ && wct[m] + 0 <= nows - lastat) {
+      dd = wdn[m] + 0; du = wup[m] + 0
+    }
+    k = hour " " m; udn[k] += dd; uup[k] += du
+    printf("%s %s %s %s %s\n", m, wdn[m], wup[m], wct[m], nows) > staout
+  }
+  close(staout)
+  for (k in udn) {
+    split(k, kk, " ")
+    if (kk[1] + 0 > hour - 24 && kk[1] + 0 <= hour) {
+      printf("%s %s %.0f %.0f\n", kk[1], kk[2], udn[k], uup[k]) > usageout
+      tdn[kk[2]] += udn[k]; tup[kk[2]] += uup[k]
+    }
+  }
+  close(usageout)
+
   clients = ""; shown = 0
   for (i = 1; i <= n && shown < maxc; i++) {
     m = order[i]
@@ -911,6 +975,14 @@ END {
     x = put(x, "band", fstr(bandname((m in wband) ? wband[m] : "")))
     x = put(x, "signalDbm", fint(wsig[m]))
     if (wct[m] ~ /^[0-9]+$/) x = put(x, "connectedSince", fint(ms(now - wct[m] * 1000)))
+    x = put(x, "downBps", fint(rdn[m]))
+    x = put(x, "upBps", fint(rup[m]))
+    if (m in wdn) {
+      x = put(x, "downBytes24h", fint(sprintf("%.0f", tdn[m] + 0)))
+      x = put(x, "upBytes24h", fint(sprintf("%.0f", tup[m] + 0)))
+    }
+    x = put(x, "linkDownMbps", fint(mbps(wld[m])))
+    x = put(x, "linkUpMbps", fint(mbps(wlu[m])))
     if (shown) clients = clients ","
     clients = clients fmap(x)
     shown++
@@ -962,6 +1034,7 @@ END {
   rt = put(rt, "wanTxBps", fint(tx))
   rt = put(rt, "wanHistory", farr(hist))
   rt = put(rt, "clientCount", fint(n + 0))
+  rt = put(rt, "clientUsageSince", fint(ENVIRON["PJ_USINCE"]))
   rt = put(rt, "clients", farr(clients))
   rt = put(rt, "radios", farr(radios))
 
@@ -1347,6 +1420,15 @@ pa_build_report() {
   [ -r "$_prev" ] || _prev=/dev/null
   _hist="$PA_TMP.history"
   [ -r "$_hist" ] || _hist=/dev/null
+  _sta="$PA_TMP.sta"
+  [ -r "$_sta" ] || _sta=/dev/null
+  _use="$PA_TMP.usage"
+  [ -r "$_use" ] || _use=/dev/null
+  # When this boot began counting each device's data: the 24 hours shrink to
+  # "since then" until a day has passed. In RAM, so a reboot starts again.
+  [ -r "$PA_TMP.usage.since" ] || printf '%s\n' "$PA_WALL" > "$PA_TMP.usage.since"
+  read -r _usince < "$PA_TMP.usage.since"
+  if pa_isnum "$_usince"; then pa_ms _usince "$_usince"; else _usince=''; fi
   # The position, best source first: the owner's pin (exact, and always wins), the
   # Wi-Fi fix (tens of metres), else the city the IP lookup gave, as a
   # PA_IP_AREA_RADIUS_M area. The flag keeps pa_write_report's updateMask in step,
@@ -1385,15 +1467,24 @@ pa_build_report() {
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
     PJ_RX=${PA_RX_BPS:-} PJ_TX=${PA_TX_BPS:-} PJ_HRX=${PA_HRX_BPS:-} PJ_HTX=${PA_HTX_BPS:-} \
-    PJ_LAT=$_plat PJ_LON=$_plon PJ_ACC=$_pacc PJ_PSRC=$_psrc \
+    PJ_LAT=$_plat PJ_LON=$_plon PJ_ACC=$_pacc PJ_PSRC=$_psrc PJ_USINCE=$_usince \
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
+      -v prevsta="$_sta" -v staout="$PA_TMP.sta.new" -v usage="$_use" -v usageout="$PA_TMP.usage.new" \
       -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
       -v maxc="$PA_MAX_CLIENTS" -v hmax="$PA_HISTORY_MAX" -v hspace="$PA_HISTORY_SPACING" \
       -v hage="$PA_HISTORY_AGE" "$PA_AWK_ESC$PA_AWK_REPORT" \
-      "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$PA_TMP.wifi"
+      "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$_sta" "$_use" "$PA_TMP.wifi"
   _rc=$?
   [ -f "$PA_TMP.survey.new" ] && mv -f "$PA_TMP.survey.new" "$PA_TMP.survey"
+  # The counters and the buckets they fed move on together, written or not: the
+  # bytes are counted where they belong whether or not this report reaches Firebase.
+  # No buckets left means every device aged out of the day.
+  if [ "$_rc" = 0 ]; then
+    [ -f "$PA_TMP.sta.new" ] && mv -f "$PA_TMP.sta.new" "$PA_TMP.sta"
+    if [ -f "$PA_TMP.usage.new" ]; then mv -f "$PA_TMP.usage.new" "$PA_TMP.usage"; else rm -f "$PA_TMP.usage"; fi
+  fi
+  rm -f "$PA_TMP.sta.new" "$PA_TMP.usage.new"
   rm -f "$PA_TMP.wifi" "$PA_TMP.names"
   return $_rc
 }
