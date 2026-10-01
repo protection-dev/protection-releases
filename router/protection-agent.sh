@@ -20,7 +20,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.4.0 (9)"
+PA_AGENT_VERSION="1.4.1 (10)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -815,7 +815,7 @@ function flush() {
     remember(cur)
     if (!(cur in counted)) { counted[cur] = 1; rcount[curparent]++ }
   }
-  cur = ""; savg = ""; ssig = ""; sct = ""; santa = ""; sdn = ""; sup = ""; sld = ""; slu = ""
+  cur = ""; savg = ""; ssig = ""; sct = ""; santa = ""; sdn = ""; sup = ""; sld = ""; slu = ""; tdtot = 0
 }
 # Bytes a station moved since the previous report, from two readings of a counter
 # that starts again at 0 when it reconnects. A smaller reading while it stayed
@@ -826,7 +826,9 @@ function grew(now, before, ct, pct) {
   if (ct ~ /^[0-9]+$/ && pct ~ /^[0-9]+$/ && ct + 0 >= pct + 0 && before + 0 >= 2147483648 && before + 0 < 4294967296) return now + 4294967296 - before
   return now + 0
 }
-function mbps(v) { return (v + 0 > 0) ? sprintf("%.0f", v + 0) : "" }
+# A link rate in Mbit/s. Under 6.5 (the slowest 802.11n data rate) is a keep-alive
+# or a management frame sent at a basic rate, which says nothing about the link.
+function mbps(v) { return (v + 0 >= 6.5) ? sprintf("%.0f", v + 0) : "" }
 FILENAME == leases {
   m = tolower($2)
   if (macok(m)) { lip[m] = $3; if ($4 != "*" && $4 != "") lname[m] = $4 }
@@ -896,7 +898,9 @@ FILENAME == wifi {
     else if ($1 == "rx" && $2 == "bitrate:") slu = $3
   } else if (mode == "wl") {
     if ($1 == "in" && $2 == "network") sct = $3
-    else if ($1 == "tx" && $2 == "total" && $3 == "bytes:") sdn = $4
+    else if ($1 == "tx" && $2 == "total" && $3 == "bytes:") { sdn = $4; tdtot = 1 }
+    # Older drivers (the RT-N18U) have no total, only data bytes: the same count.
+    else if ($1 == "tx" && $2 == "data" && $3 == "bytes:") { if (!tdtot) sdn = $4 }
     else if ($1 == "rx" && $2 == "data" && $3 == "bytes:") sup = $4
     else if ($0 ~ /rate of last tx pkt:/) { v = $0; sub(/.*pkt:[ \t]*/, "", v); sld = (v + 0) / 1000 }
     else if ($0 ~ /rate of last rx pkt:/) { v = $0; sub(/.*pkt:[ \t]*/, "", v); slu = (v + 0) / 1000 }
