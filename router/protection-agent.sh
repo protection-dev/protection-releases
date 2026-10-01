@@ -957,7 +957,10 @@ pa_ipinfo() {
   PA_LOC=''
   PA_LAT=''
   PA_LON=''
-  _cache="$PA_TMP.ipinfo"
+  # Versioned with its line layout. Agents before coordinates wrote five lines to
+  # `$PA_TMP.ipinfo`, and /tmp outlives an upgrade: read as-is, that cache would
+  # pass for fresh and leave an upgraded router with no position for six hours.
+  _cache="$PA_TMP.ipinfo.v2"
   if [ -r "$_cache" ]; then
     {
       read -r _at
@@ -1749,12 +1752,13 @@ EOF
       # Keep the agent and its credential across a firmware upgrade, and the
       # service's boot links too: sysupgrade restores the files listed here but
       # not /etc/rc.d, so without the links the agent would survive an upgrade
-      # installed yet disabled, and never start again.
-      _keep="$PA_ROOT/etc/sysupgrade.conf"
+      # installed yet disabled, and never start again. (Not `_keep`: setup holds
+      # its "already approved" verdict in that name across this call.)
+      _sysupgrade="$PA_ROOT/etc/sysupgrade.conf"
       for _f in "$PA_CONF" "$PA_BIN" "$_init" \
         "$PA_ROOT/etc/rc.d/S99protection-agent" "$PA_ROOT/etc/rc.d/K10protection-agent"; do
         _f=${_f#"$PA_ROOT"}
-        grep -qx "$_f" "$_keep" 2>/dev/null || printf '%s\n' "$_f" >> "$_keep"
+        grep -qx "$_f" "$_sysupgrade" 2>/dev/null || printf '%s\n' "$_f" >> "$_sysupgrade"
       done
       ;;
   esac
@@ -1770,8 +1774,8 @@ pa_autostart_off() {
     openwrt)
       pa_initd disable 2>/dev/null
       rm -f "$PA_ROOT/etc/init.d/protection-agent"
-      _keep="$PA_ROOT/etc/sysupgrade.conf"
-      [ -f "$_keep" ] && sed -i '/protection-agent/d' "$_keep"
+      _sysupgrade="$PA_ROOT/etc/sysupgrade.conf"
+      [ -f "$_sysupgrade" ] && sed -i '/protection-agent/d' "$_sysupgrade"
       ;;
   esac
   return 0
