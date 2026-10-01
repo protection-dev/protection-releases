@@ -20,7 +20,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.3.2 (7)"
+PA_AGENT_VERSION="1.3.3 (8)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -1563,6 +1563,10 @@ pa_epoch() {
 pa_set_token() {
   PA_ID_TOKEN=$1
   PA_TOKEN_AT=$PA_NOW
+  pa_write_auth "$1"
+}
+
+pa_write_auth() {
   (
     umask 077
     printf 'Authorization: Bearer %s\n' "$1" > "$PA_TMP.auth"
@@ -1609,6 +1613,9 @@ pa_refresh() {
 pa_token() {
   if [ -n "${PA_ID_TOKEN:-}" ] && [ $((PA_NOW - ${PA_TOKEN_AT:-0})) -ge 0 ] &&
     [ $((PA_NOW - ${PA_TOKEN_AT:-0})) -lt "$PA_TOKEN_LIFE" ]; then
+    # Requests send the header file, not the variable: without it they would go
+    # out unauthenticated, be refused (403, not 401) and park the agent dormant.
+    [ -r "$PA_TMP.auth" ] || pa_write_auth "$PA_ID_TOKEN"
     return 0
   fi
   pa_refresh
@@ -1840,7 +1847,18 @@ pa_running_pid() {
 }
 
 pa_sleep() {
-  ${PA_SLEEP:-sleep} "$1"
+  if [ -n "${PA_SLEEP:-}" ]; then
+    $PA_SLEEP "$1"
+    return 0
+  fi
+  # In the background and waited for: a shell runs a trap only once its foreground
+  # command ends, so a stop (setup restarting the agent) would otherwise wait out
+  # the whole sleep, up to an hour, while the new agent was already running.
+  sleep "$1" &
+  PA_SLEEP_PID=$!
+  wait "$PA_SLEEP_PID"
+  PA_SLEEP_PID=''
+  return 0
 }
 
 # Whether the loop may go round again at once. A few times in a row at most, so
@@ -1919,6 +1937,21 @@ pa_contact() {
   return 0
 }
 
+# Stopping (TERM or INT): the files go only while the pid file is still this
+# agent's. A stopped agent can finish a request after setup has started its
+# successor, and deleting that one's pid file and credential header would leave it
+# unauthenticated (an hour dormant) and invisible to `start`, which would then run
+# a second copy.
+pa_exit() {
+  [ -n "${PA_SLEEP_PID:-}" ] && kill "$PA_SLEEP_PID" 2>/dev/null
+  _owner=''
+  pa_read _owner "$PA_PIDFILE"
+  if [ "$_owner" = "$$" ]; then
+    rm -f "$PA_PIDFILE" "$PA_TMP.auth" "$PA_TMP.req" "$PA_TMP.resp" "$PA_TMP.body"
+  fi
+  exit 0
+}
+
 # The loop. It never exits on its own while enrolled; a removed or unknown router
 # looks again hourly, in case the owner re-approves it.
 pa_run() {
@@ -1929,7 +1962,7 @@ pa_run() {
     pa_die "already running (pid $PA_PID)."
   fi
   printf '%s\n' "$$" > "$PA_PIDFILE"
-  trap 'rm -f "$PA_PIDFILE" "$PA_TMP.auth" "$PA_TMP.req" "$PA_TMP.resp" "$PA_TMP.body"; exit 0' INT TERM
+  trap pa_exit INT TERM
   # The SSH session that started it closing must not take it down.
   trap '' HUP
   pa_init_platform
@@ -2038,6 +2071,14 @@ pa_stop() {
   fi
   if pa_running_pid; then
     kill "$PA_PID" 2>/dev/null
+    # Gone at once from a sleep; mid-request it finishes the request first. Wait a
+    # little so a restart does not overlap, but not for a slow request: pa_exit
+    # leaves a successor's files alone either way.
+    _w=0
+    while [ "$_w" -lt 10 ] && kill -0 "$PA_PID" 2>/dev/null; do
+      sleep 1
+      _w=$((_w + 1))
+    done
   fi
   rm -f "$PA_PIDFILE"
   return 0
@@ -2059,8 +2100,9 @@ pa_autostart_on() {
     merlin)
       # Merlin runs /jffs/scripts/services-start at boot, but only with custom
       # scripts enabled. It is a system setting, so say so rather than do it quietly.
-      pa_nv jffs2_scripts
-      if [ "$PA_V" != 1 ]; then
+      # Read live, not from the snapshot: a setup that keeps its enrolment never
+      # takes one, and would otherwise "enable" it (and write flash) every time.
+      if [ "$(nvram get jffs2_scripts 2>/dev/null)" != 1 ]; then
         nvram set jffs2_scripts=1 && nvram commit
         pa_say "Enabled 'JFFS custom scripts' (Administration > System), needed to start at boot."
       fi
