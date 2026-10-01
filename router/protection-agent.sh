@@ -60,6 +60,12 @@ PA_AUTH_URL="${PA_AUTH_URL:-https://identitytoolkit.googleapis.com/v1/accounts:s
 PA_TOKEN_URL="${PA_TOKEN_URL:-https://securetoken.googleapis.com/v1/token}"
 PA_FS_URL="${PA_FS_URL:-https://firestore.googleapis.com/v1}"
 PA_IPINFO_URL="${PA_IPINFO_URL:-https://ipinfo.io/json}"
+# A router's only fix is the city-level one its public IP gives, so the map shows
+# an area, not a false point: the coordinates ride the device's own location
+# fields with this radius as the accuracy, and the owner clients draw the disc.
+# Mirrors TrackingConfig.ROUTER_IP_AREA_RADIUS_M and PositionSource.IP_ADDRESS.
+PA_IP_AREA_RADIUS_M="${PA_IP_AREA_RADIUS_M:-25000}"
+PA_POSITION_SOURCE=IP_ADDRESS
 
 # -- Small helpers -----------------------------------------------------------------
 
@@ -700,6 +706,7 @@ function esc(s,    out, i, c) {
 PA_AWK_REPORT='
 function fstr(s) { return (s == "") ? "" : "{\"stringValue\":\"" esc(s) "\"}" }
 function fint(n) { return (n ~ /^-?[0-9]+$/) ? "{\"integerValue\":\"" n "\"}" : "" }
+function fdbl(n) { return (n ~ /^-?[0-9]+(\.[0-9]+)?$/) ? "{\"doubleValue\":" n "}" : "" }
 function put(acc, name, v) { if (v == "") return acc; return acc (acc == "" ? "" : ",") "\"" name "\":" v }
 function fmap(fields) { return "{\"mapValue\":{\"fields\":{" fields "}}}" }
 function farr(values) { return (values == "") ? "{\"arrayValue\":{}}" : "{\"arrayValue\":{\"values\":[" values "]}}" }
@@ -880,6 +887,17 @@ END {
   out = put(out, "router", fmap(rt))
   out = put(out, "lastSeenAt", stamp)
   out = put(out, "appVersion", fstr(ENVIRON["PJ_AG"]))
+  # A router has only a coarse, IP-based position. It rides the very fields a
+  # phone GPS fix uses, so the owner map and its accuracy disc place the router
+  # as a wide somewhere-in-this-area circle with no router-specific client code.
+  # The shell keeps the PATCH updateMask in step with whether these were emitted.
+  if (fdbl(ENVIRON["PJ_LAT"]) != "" && fdbl(ENVIRON["PJ_LON"]) != "") {
+    out = put(out, "latitude", fdbl(ENVIRON["PJ_LAT"]))
+    out = put(out, "longitude", fdbl(ENVIRON["PJ_LON"]))
+    out = put(out, "accuracyMeters", fdbl(ENVIRON["PJ_ACC"]))
+    out = put(out, "positionSource", fstr(ENVIRON["PJ_PSRC"]))
+    out = put(out, "locationCapturedAt", stamp)
+  }
   if (ENVIRON["PJ_FULFIL"] == "1") out = put(out, "locationRequestFulfilledAt", stamp)
   printf "{\"fields\":{%s}}\n", out
 }
@@ -916,14 +934,29 @@ pa_is_public() {
   return 1
 }
 
-# The public address, ISP and city, from ipinfo.io, cached for six hours or until
-# the router's WAN address changes. Best effort: a router whose resolver filters
-# lookup services (NextDNS lists, AdGuard) just reports none, and the report
-# still goes out. Sets PA_IP_PUBLIC, PA_ISP and PA_LOC.
+# A decimal coordinate: optional sign, digits, optional fraction. Matched exactly
+# as the report builder's `fdbl` matches it, so the shell flag that decides the
+# updateMask never disagrees with whether awk actually emitted the coordinate.
+pa_is_coord() {
+  _c=$1
+  case $_c in -*) _c=${_c#-} ;; esac
+  case $_c in
+    '' | *[!0-9.]* | .* | *. | *.*.*) return 1 ;;
+  esac
+  return 0
+}
+
+# The public address, ISP, city and coordinates, from ipinfo.io, cached for six
+# hours or until the router's WAN address changes. Best effort: a router whose
+# resolver filters lookup services (NextDNS lists, AdGuard) just reports none, and
+# the report still goes out. Sets PA_IP_PUBLIC, PA_ISP, PA_LOC, and PA_LAT/PA_LON
+# from the `loc` pair (empty unless both parse as coordinates).
 pa_ipinfo() {
   PA_IP_PUBLIC=''
   PA_ISP=''
   PA_LOC=''
+  PA_LAT=''
+  PA_LON=''
   _cache="$PA_TMP.ipinfo"
   if [ -r "$_cache" ]; then
     {
@@ -932,6 +965,8 @@ pa_ipinfo() {
       read -r PA_IP_PUBLIC
       read -r PA_ISP
       read -r PA_LOC
+      read -r PA_LAT
+      read -r PA_LON
     } < "$_cache"
     if pa_isnum "$_at" && [ "$_for" = "${PA_WAN_IP:-}" ] && [ $((PA_NOW - _at)) -ge 0 ] && [ $((PA_NOW - _at)) -lt 21600 ]; then
       return 0
@@ -944,7 +979,9 @@ pa_ipinfo() {
   _org=''
   _city=''
   _country=''
+  _loc=''
   # One key per line, as ipinfo prints it: `  "org": "AS36903 Maroc Telecom",`
+  # `loc` is `"lat,lon"`, e.g. `  "loc": "33.5731,-7.5898",`.
   while IFS= read -r _l; do
     _v=${_l#*\": \"}
     _v=${_v%\"*}
@@ -953,6 +990,7 @@ pa_ipinfo() {
       *'"org":'*) _org=$_v ;;
       *'"city":'*) _city=$_v ;;
       *'"country":'*) _country=$_v ;;
+      *'"loc":'*) _loc=$_v ;;
     esac
   done < "$PA_TMP.ipinfo.json"
   rm -f "$PA_TMP.ipinfo.json"
@@ -963,7 +1001,21 @@ pa_ipinfo() {
   PA_ISP=$_org
   PA_LOC=$_city
   [ -n "$_country" ] && PA_LOC="${PA_LOC:+$PA_LOC, }$_country"
-  printf '%s\n' "$PA_NOW" "${PA_WAN_IP:-}" "$PA_IP_PUBLIC" "$PA_ISP" "$PA_LOC" > "$_cache"
+  # Split "lat,lon" and keep it only when both halves are real coordinates, so a
+  # malformed or empty `loc` leaves the router with no position rather than one at
+  # 0,0 off West Africa.
+  case $_loc in
+    *,*)
+      _lat=${_loc%%,*}
+      _lon=${_loc#*,}
+      if pa_is_coord "$_lat" && pa_is_coord "$_lon"; then
+        PA_LAT=$_lat
+        PA_LON=$_lon
+      fi
+      ;;
+  esac
+  printf '%s\n' "$PA_NOW" "${PA_WAN_IP:-}" "$PA_IP_PUBLIC" "$PA_ISP" "$PA_LOC" \
+    "$PA_LAT" "$PA_LON" > "$_cache"
 }
 
 # Collects everything and prints the Firestore write for a full report. PA_FULFIL=1
@@ -1016,12 +1068,19 @@ pa_build_report() {
   [ -r "$_prev" ] || _prev=/dev/null
   _hist="$PA_TMP.history"
   [ -r "$_hist" ] || _hist=/dev/null
+  # The device-level position fields ride this report only when the IP lookup gave
+  # real coordinates. The flag keeps pa_write_report's updateMask in step, so a
+  # report without a position never deletes a good one already on the document;
+  # awk's own fdbl guard uses the same test on the same values, so the two agree.
+  PA_HAS_POSITION=0
+  if pa_is_coord "${PA_LAT:-}" && pa_is_coord "${PA_LON:-}"; then PA_HAS_POSITION=1; fi
   rm -f "$PA_TMP.history.added"
   PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FULFIL=${PA_FULFIL:-0} \
     PJ_BOOTED=$_booted PJ_CPU=${PA_CPU:-} PJ_MU=${PA_MEM_USED:-} PJ_MT=${PA_MEM_TOTAL:-} \
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
     PJ_RX=${PA_RX_BPS:-} PJ_TX=${PA_TX_BPS:-} PJ_HRX=${PA_HRX_BPS:-} PJ_HTX=${PA_HTX_BPS:-} \
+    PJ_LAT=${PA_LAT:-} PJ_LON=${PA_LON:-} PJ_ACC=$PA_IP_AREA_RADIUS_M PJ_PSRC=$PA_POSITION_SOURCE \
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
       -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
@@ -1259,6 +1318,10 @@ pa_poll() {
 # 0 written, 1 no answer, 2 refused.
 pa_write_report() {
   _mask='updateMask.fieldPaths=router&updateMask.fieldPaths=lastSeenAt&updateMask.fieldPaths=appVersion'
+  # Only name the position paths when this report carried a position, so a report
+  # built while the IP lookup was down leaves the last good fix in place instead
+  # of blanking it (a masked path with no value in the body is a field delete).
+  [ "${PA_HAS_POSITION:-0}" = 1 ] && _mask="$_mask&updateMask.fieldPaths=latitude&updateMask.fieldPaths=longitude&updateMask.fieldPaths=accuracyMeters&updateMask.fieldPaths=positionSource&updateMask.fieldPaths=locationCapturedAt"
   [ "$2" = 1 ] && _mask="$_mask&updateMask.fieldPaths=locationRequestFulfilledAt"
   pa_http PATCH "$PA_DEVICE_URL?$_mask" "$1" application/json 1 || return 1
   case $PA_STATUS in
