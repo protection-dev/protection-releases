@@ -20,7 +20,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.3.0 (5)"
+PA_AGENT_VERSION="1.3.1 (6)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -127,6 +127,15 @@ pa_read() {
 }
 
 # pa_isnum VALUE: a non-negative integer.
+# pa_ms VAR SECONDS: the same in milliseconds, written out rather than multiplied,
+# since epoch milliseconds overflow a 32-bit shell (BusyBox on an RT-N18U).
+pa_ms() {
+  case $2 in
+    0) eval "$1=0" ;;
+    *) eval "$1=\${2}000" ;;
+  esac
+}
+
 pa_isnum() {
   case $1 in
     '' | *[!0-9]*) return 1 ;;
@@ -409,6 +418,27 @@ pa_wan() {
 # between two five-minute reports (it can, at 100 Mbps) is caught and corrected.
 # Two windows over the same bytes: PA_ACC_* since the last report (the headline
 # rate), PA_HACC_* since the last chart point (that point's average).
+#
+# The sums are awk's, not the shell's: some BusyBox shells do 32-bit arithmetic
+# (Merlin on an RT-N18U), which a few minutes of traffic overflows. awk's doubles
+# stay exact to 2^53 bytes. A negative delta means a 32-bit counter wrapped (add
+# 2^32) or the interface was reset (count nothing rather than a bogus terabyte).
+PA_AWK_ACCUMULATE='
+function delta(now, prev,   x) {
+  x = now - prev
+  if (x < 0) {
+    if (prev < 4294967296) x += 4294967296
+    if (x < 0 || prev >= 4294967296) x = 0
+  }
+  return x
+}
+BEGIN {
+  r = delta(rx, prx)
+  t = delta(tx, ptx)
+  printf "%.0f %.0f %.0f %.0f\n", arx + r, atx + t, hrx + r, htx + t
+}
+'
+
 pa_accumulate() {
   [ -n "$PA_WAN_DEV" ] || return 0
   _stat="$PA_ROOT/sys/class/net/$PA_WAN_DEV/statistics"
@@ -419,14 +449,16 @@ pa_accumulate() {
     return 0
   fi
   if [ -n "${PA_PREV_RX:-}" ] && [ "${PA_PREV_DEV:-}" = "$PA_WAN_DEV" ]; then
-    _d=$((_rx - PA_PREV_RX))
-    [ "$_d" -lt 0 ] && _d=$(pa_unwrap "$_d" "$PA_PREV_RX")
-    PA_ACC_RX=$((${PA_ACC_RX:-0} + _d))
-    PA_HACC_RX=$((${PA_HACC_RX:-0} + _d))
-    _d=$((_tx - PA_PREV_TX))
-    [ "$_d" -lt 0 ] && _d=$(pa_unwrap "$_d" "$PA_PREV_TX")
-    PA_ACC_TX=$((${PA_ACC_TX:-0} + _d))
-    PA_HACC_TX=$((${PA_HACC_TX:-0} + _d))
+    # shellcheck disable=SC2046
+    set -- $(awk -v rx="$_rx" -v tx="$_tx" -v prx="$PA_PREV_RX" -v ptx="$PA_PREV_TX" \
+      -v arx="${PA_ACC_RX:-0}" -v atx="${PA_ACC_TX:-0}" \
+      -v hrx="${PA_HACC_RX:-0}" -v htx="${PA_HACC_TX:-0}" "$PA_AWK_ACCUMULATE")
+    if pa_isnum "${4:-}"; then
+      PA_ACC_RX=$1
+      PA_ACC_TX=$2
+      PA_HACC_RX=$3
+      PA_HACC_TX=$4
+    fi
   else
     # A new device (WAN failover) or the first sample: start both windows here.
     PA_ACC_RX=0
@@ -439,16 +471,6 @@ pa_accumulate() {
   PA_PREV_RX=$_rx
   PA_PREV_TX=$_tx
   PA_PREV_DEV=$PA_WAN_DEV
-}
-
-# A negative delta: a 32-bit counter wrapped (add 2^32), or the interface was reset
-# (count nothing rather than a bogus terabyte).
-pa_unwrap() {
-  if [ "$2" -lt 4294967296 ]; then
-    _w=$(($1 + 4294967296))
-    [ "$_w" -ge 0 ] && { printf '%s' "$_w"; return; }
-  fi
-  printf '0'
 }
 
 # The average rate since the last report, then a fresh window. Empty until a
@@ -467,15 +489,25 @@ pa_rates() {
   if [ -n "${PA_HACC_FROM:-}" ]; then
     _span=$((PA_NOW - PA_HACC_FROM))
     if [ "$_span" -ge "$PA_HISTORY_MIN_WINDOW" ]; then
-      PA_HRX_BPS=$((PA_HACC_RX * 8 / _span))
-      PA_HTX_BPS=$((PA_HACC_TX * 8 / _span))
+      # shellcheck disable=SC2046
+      set -- $(pa_bps "$_span" "$PA_HACC_RX" "$PA_HACC_TX")
+      PA_HRX_BPS=${1:-}
+      PA_HTX_BPS=${2:-}
     fi
   fi
   [ -n "${PA_ACC_FROM:-}" ] || return 0
   _span=$((PA_NOW - PA_ACC_FROM))
   [ "$_span" -ge 5 ] || return 0
-  PA_RX_BPS=$((PA_ACC_RX * 8 / _span))
-  PA_TX_BPS=$((PA_ACC_TX * 8 / _span))
+  # shellcheck disable=SC2046
+  set -- $(pa_bps "$_span" "$PA_ACC_RX" "$PA_ACC_TX")
+  PA_RX_BPS=${1:-}
+  PA_TX_BPS=${2:-}
+}
+
+# pa_bps SECONDS RXBYTES TXBYTES: both as whole bits per second, in awk because
+# bytes times 8 overflows a 32-bit shell past 268 MB.
+pa_bps() {
+  awk -v s="$1" -v r="$2" -v t="$3" 'BEGIN { printf "%.0f %.0f\n", int(r * 8 / s), int(t * 8 / s) }'
 }
 
 pa_rates_reset() {
@@ -484,29 +516,37 @@ pa_rates_reset() {
   PA_ACC_FROM=$PA_NOW
 }
 
-# CPU busy percent since the previous report, from /proc/stat's first line.
+# CPU busy percent since the previous report, from /proc/stat's first line: user
+# through steal make the total, idle and iowait the idle. Summed in awk, as the
+# jiffy totals pass 2^31 after a few months up, where a 32-bit shell wraps.
+PA_AWK_CPU='
+NR == 1 {
+  for (i = 2; i <= 9 && i <= NF; i++) if ($i ~ /^[0-9]+$/) total += $i
+  if ($5 ~ /^[0-9]+$/) idle += $5
+  if ($6 ~ /^[0-9]+$/) idle += $6
+  busy = ""
+  if (pt != "") {
+    dt = total - pt
+    di = idle - pi
+    if (dt > 0 && di >= 0) {
+      busy = int((dt - di) * 100 / dt)
+      if (busy < 0) busy = 0
+      if (busy > 100) busy = 100
+    }
+  }
+  printf "%.0f %.0f %s\n", total, idle, busy
+  exit
+}
+'
+
 pa_cpu() {
   PA_CPU=''
   [ -r "$PA_ROOT/proc/stat" ] || return 0
-  read -r _c _u _n _s _i _w _q _sq _st _rest < "$PA_ROOT/proc/stat"
-  _total=0
-  for _v in "$_u" "$_n" "$_s" "$_i" "$_w" "$_q" "$_sq" "$_st"; do
-    pa_isnum "$_v" && _total=$((_total + _v))
-  done
-  _idle=0
-  pa_isnum "$_i" && _idle=$_i
-  pa_isnum "$_w" && _idle=$((_idle + _w))
-  if [ -n "${PA_CPU_TOTAL:-}" ]; then
-    _dt=$((_total - PA_CPU_TOTAL))
-    _di=$((_idle - PA_CPU_IDLE))
-    if [ "$_dt" -gt 0 ] && [ "$_di" -ge 0 ]; then
-      PA_CPU=$(((_dt - _di) * 100 / _dt))
-      [ "$PA_CPU" -lt 0 ] && PA_CPU=0
-      [ "$PA_CPU" -gt 100 ] && PA_CPU=100
-    fi
-  fi
-  PA_CPU_TOTAL=$_total
-  PA_CPU_IDLE=$_idle
+  # shellcheck disable=SC2046
+  set -- $(awk -v pt="${PA_CPU_TOTAL:-}" -v pi="${PA_CPU_IDLE:-}" "$PA_AWK_CPU" "$PA_ROOT/proc/stat")
+  PA_CPU_TOTAL=${1:-}
+  PA_CPU_IDLE=${2:-}
+  PA_CPU=${3:-}
 }
 
 # Memory in bytes. "Used" excludes page cache (MemTotal - MemAvailable), and falls
@@ -535,8 +575,11 @@ pa_memory() {
   pa_isnum "$_tot" || return 0
   [ -n "$_avail" ] || _avail=$((_free + _buf + _cached + _srec))
   [ "$_avail" -gt "$_tot" ] && _avail=$_tot
-  PA_MEM_TOTAL=$((_tot * 1024))
-  PA_MEM_USED=$(((_tot - _avail) * 1024))
+  # Bytes in awk: 2 GB of RAM overflows a 32-bit shell's arithmetic.
+  # shellcheck disable=SC2046
+  set -- $(awk -v t="$_tot" -v a="$_avail" 'BEGIN { printf "%.0f %.0f\n", t * 1024, (t - a) * 1024 }')
+  PA_MEM_TOTAL=${1:-}
+  PA_MEM_USED=${2:-}
 }
 
 # The hottest sensor the firmware exposes, in whole degrees C.
@@ -952,6 +995,11 @@ pa_wall() {
   set -- $(date -u '+%s %Y-%m-%dT%H:%M:%SZ')
   PA_WALL=$1
   PA_ISO=$2
+  if ! pa_isnum "$PA_WALL"; then
+    # A C library whose date formats have no %s: work the seconds out from the date.
+    PA_ISO=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    pa_epoch PA_WALL "$PA_ISO"
+  fi
   pa_isnum "$PA_WALL" || PA_WALL=0
 }
 
@@ -1264,9 +1312,9 @@ pa_build_report() {
   pa_wall
   pa_ipinfo
   pa_wifigeo
-  _nowms=$((PA_WALL * 1000))
+  pa_ms _nowms "$PA_WALL"
   _booted=''
-  [ -n "${PA_UP:-}" ] && _booted=$(((PA_WALL - PA_UP) * 1000))
+  [ -n "${PA_UP:-}" ] && pa_ms _booted $((PA_WALL - PA_UP))
   # The last outage this router outlived, kept in RAM across agent restarts.
   _oa=''
   _ob=''
@@ -1278,7 +1326,7 @@ pa_build_report() {
   [ -r "$PA_TMP.since" ] || printf '%s\n' "$_nowms" > "$PA_TMP.since"
   read -r _since < "$PA_TMP.since"
   if [ -n "${PA_WAN_UP:-}" ]; then
-    _wanup=$(((PA_WALL - PA_WAN_UP) * 1000))
+    pa_ms _wanup $((PA_WALL - PA_WAN_UP))
   elif [ -n "$_ob" ]; then
     _wanup=$_ob
   else
@@ -1473,6 +1521,10 @@ pa_fsval() {
 }
 
 # pa_epoch VAR RFC3339: epoch seconds, or empty when it is not a timestamp.
+# Shell arithmetic rather than `date -d`, which some BusyBox builds lack (Merlin
+# on an RT-N18U): days since 1970 from the civil date (Howard Hinnant's
+# days_from_civil). The two-digit fields lose a leading zero first, or the
+# shell would read 08 and 09 as bad octal.
 pa_epoch() {
   _t=${2%%[.Z]*}
   case $_t in
@@ -1482,9 +1534,27 @@ pa_epoch() {
       return 1
       ;;
   esac
-  _e=$(date -u -d "${_t%%T*} ${_t#*T}" +%s 2>/dev/null)
-  pa_isnum "$_e" || _e=''
-  eval "$1=\$_e"
+  _ey=${_t%%-*}
+  _t=${_t#*-}
+  _emo=${_t%%-*}
+  _t=${_t#*-}
+  _ed=${_t%%T*}
+  _t=${_t#*T}
+  _eh=${_t%%:*}
+  _t=${_t#*:}
+  _emi=${_t%%:*}
+  _es=${_t#*:}
+  _emo=${_emo#0}
+  _ed=${_ed#0}
+  _eh=${_eh#0}
+  _emi=${_emi#0}
+  _es=${_es#0}
+  _ey=$((_ey - (_emo <= 2)))
+  _eera=$((_ey / 400))
+  _eyoe=$((_ey - _eera * 400))
+  _edoy=$(((153 * ((_emo + 9) % 12) + 2) / 5 + _ed - 1))
+  _edays=$((_eera * 146097 + _eyoe * 365 + _eyoe / 4 - _eyoe / 100 + _edoy - 719468))
+  eval "$1=\$((_edays * 86400 + _eh * 3600 + _emi * 60 + _es))"
 }
 
 # Keeps the ID token in a file only root can read, for pa_http's -H @file.
@@ -1895,7 +1965,9 @@ pa_run() {
       # agent restart does not lose it) and send a full report straight away so
       # the owner sees how long it lasted.
       if [ -n "$_fail_from" ] && [ $((PA_NOW - _fail_from)) -ge "$PA_OUTAGE_MIN" ]; then
-        printf '%s %s\n' "$(((PA_WALL - (PA_NOW - _fail_from)) * 1000))" "$((PA_WALL * 1000))" > "$PA_TMP.outage"
+        pa_ms _down_ms $((PA_WALL - (PA_NOW - _fail_from)))
+        pa_ms _up_ms "$PA_WALL"
+        printf '%s %s\n' "$_down_ms" "$_up_ms" > "$PA_TMP.outage"
         pa_log "internet back after $((PA_NOW - _fail_from))s"
         _fail_from=''
         _fails=0
@@ -2050,13 +2122,31 @@ pa_autostart_off() {
 
 # The one command behind the one line the owner pastes: install, enrol, start.
 # Running it again upgrades the agent in place and keeps a working enrolment.
+# Whether the agent runs as root. Merlin's BusyBox has no `id` (an RT-N18U), so
+# the effective uid can come from /proc instead; when neither can tell, the
+# setup goes ahead and any step root needs fails on its own.
+pa_is_root() {
+  if pa_have id; then
+    [ "$(id -u)" = 0 ]
+    return
+  fi
+  [ -r "/proc/$$/status" ] || return 0
+  while read -r _k _ruid _euid _rest; do
+    if [ "$_k" = Uid: ]; then
+      [ "$_euid" = 0 ]
+      return
+    fi
+  done < "/proc/$$/status"
+  return 0
+}
+
 pa_setup() {
   _self=$1
   _code=$2
   _project=$3
   _key=$4
   [ "$PA_PLATFORM" = unknown ] && pa_die "this router is not running Asuswrt-Merlin or OpenWrt."
-  [ -n "$PA_ROOT" ] || [ "$(id -u)" = 0 ] || pa_die "run this as the router's admin (root) user."
+  [ -n "$PA_ROOT" ] || pa_is_root || pa_die "run this as the router's admin (root) user."
   pa_valid_project "$_project" && pa_valid_key "$_key" ||
     pa_die "usage: protection-agent setup CODE PROJECT KEY. Copy the command again from the app."
   pa_ensure_curl || pa_die "curl is missing and could not be installed. Install curl, then run this again."
