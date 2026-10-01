@@ -21,7 +21,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.5.0 (11)"
+PA_AGENT_VERSION="1.5.1 (12)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -690,6 +690,9 @@ pa_wifi_merlin() {
     _ssid=$PA_V
     pa_chanspec "$(wl -i "$_if" chanspec 2>/dev/null)"
     printf '@RADIO\t%s\t%s\t%s\t%s\t%s\n' "$_if" "$_band" "$PA_CH" "$PA_WIDTH" "$_ssid"
+    # How busy the channel is, from the driver's own channel-utilisation sample.
+    printf '@CHANIM\t%s\n' "$_if"
+    wl -i "$_if" chanim_stats 2>/dev/null
     # The radio itself, then its guest networks, all counted against the radio.
     for _vif in "$_if" "wl$_u.1" "wl$_u.2" "wl$_u.3"; do
       if [ "$_vif" != "$_if" ]; then
@@ -888,7 +891,18 @@ FILENAME == wifi {
   if ($0 ~ /^@IF\t/) { flush(); split($0, f, "\t"); curif = f[2]; curband = f[3]; curparent = f[4]; mode = ""; next }
   if ($0 ~ /^@STA\t/) { flush(); split($0, f, "\t"); cur = tolower(f[2]); mode = "wl"; next }
   if ($0 ~ /^@SURVEY\t/) { flush(); split($0, f, "\t"); sif = f[2]; mode = "survey"; inuse = 0; next }
+  if ($0 ~ /^@CHANIM\t/) { flush(); split($0, f, "\t"); cif = f[2]; mode = "chanim"; cidx = 0; next }
   if ($1 == "Station") { flush(); cur = tolower($2); mode = "iw"; next }
+  # Broadcom `wl chanim_stats`: a header naming the columns, then one sample per
+  # line, the newest last. The channel was busy for whatever share was not idle.
+  if (mode == "chanim") {
+    if ($1 == "chanspec") { for (i = 1; i <= NF; i++) if ($i == "idle") cidx = i }
+    else if (cidx > 0 && $1 ~ /^0x/ && $cidx ~ /^[0-9]+$/) {
+      v = 100 - $cidx; if (v < 0) v = 0; if (v > 100) v = 100
+      cbusy[cif] = v
+    }
+    next
+  }
   if (mode == "survey") {
     if ($0 ~ /frequency:/) inuse = ($0 ~ /in use/)
     else if (inuse && $0 ~ /channel active time:/) sact[sif] = $4
@@ -926,7 +940,8 @@ END {
   flush()
   now = ENVIRON["PJ_NOW_MS"] + 0
 
-  # Radios, with airtime from the survey counters since the previous report.
+  # Radios, with airtime from the survey counters since the previous report
+  # (OpenWrt), or from the driver channel-utilisation sample (Broadcom).
   radios = ""
   for (i = 1; i <= nr; i++) {
     r = rif[i]; util = ""
@@ -935,6 +950,7 @@ END {
       if (util < 0) util = 0; if (util > 100) util = 100
     }
     if (r in sact) { printf("%s %s %s\n", r, sact[r], sbusy[r]) > surveyout; nsurv++ }
+    else if (r in cbusy) { util = cbusy[r]; nsurv++ }
     x = ""
     x = put(x, "band", fstr(bandname(rband[i])))
     x = put(x, "ssid", fstr(rssid[i]))
