@@ -19,7 +19,7 @@
 # PA_SOURCED=1 loads the functions without running anything, and PA_FAKE_EPOCH
 # pins the wall clock.
 
-PA_AGENT_VERSION="1.1.0 (2)"
+PA_AGENT_VERSION="1.2.0 (3)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -42,6 +42,9 @@ PA_MAX_CLIENTS=64
 # Traffic history: 48 samples, at least 270 s apart, none older than 4 hours.
 PA_HISTORY_MAX=48
 PA_HISTORY_SPACING=270
+# The least traffic a chart point may average over, so the first point after a start
+# is not a ten-second blip.
+PA_HISTORY_MIN_WINDOW=60
 PA_HISTORY_AGE=14400
 # Firebase ID tokens live an hour; refresh after 50 minutes.
 PA_TOKEN_LIFE=3000
@@ -360,6 +363,8 @@ pa_wan() {
 
 # WAN byte counters, accumulated every contact so a 32-bit counter that wraps
 # between two five-minute reports (it can, at 100 Mbps) is caught and corrected.
+# Two windows over the same bytes: PA_ACC_* since the last report (the headline
+# rate), PA_HACC_* since the last chart point (that point's average).
 pa_accumulate() {
   [ -n "$PA_WAN_DEV" ] || return 0
   _stat="$PA_ROOT/sys/class/net/$PA_WAN_DEV/statistics"
@@ -373,14 +378,19 @@ pa_accumulate() {
     _d=$((_rx - PA_PREV_RX))
     [ "$_d" -lt 0 ] && _d=$(pa_unwrap "$_d" "$PA_PREV_RX")
     PA_ACC_RX=$((${PA_ACC_RX:-0} + _d))
+    PA_HACC_RX=$((${PA_HACC_RX:-0} + _d))
     _d=$((_tx - PA_PREV_TX))
     [ "$_d" -lt 0 ] && _d=$(pa_unwrap "$_d" "$PA_PREV_TX")
     PA_ACC_TX=$((${PA_ACC_TX:-0} + _d))
+    PA_HACC_TX=$((${PA_HACC_TX:-0} + _d))
   else
-    # A new device (WAN failover) or the first sample: start the window here.
+    # A new device (WAN failover) or the first sample: start both windows here.
     PA_ACC_RX=0
     PA_ACC_TX=0
     PA_ACC_FROM=$PA_NOW
+    PA_HACC_RX=0
+    PA_HACC_TX=0
+    PA_HACC_FROM=$PA_NOW
   fi
   PA_PREV_RX=$_rx
   PA_PREV_TX=$_tx
@@ -399,9 +409,24 @@ pa_unwrap() {
 
 # The average rate since the last report, then a fresh window. Empty until a
 # window of at least five seconds exists.
+#
+# And the average since the last chart point, for the next one. Separate because the
+# report pace changes: while the owner watches, reports come every ten seconds, and a
+# point taken from one of those would draw a ten-second burst as four and a half
+# minutes of traffic. Averaged over the whole gap, a point means the same thing
+# whether anyone was watching or not.
 pa_rates() {
   PA_RX_BPS=''
   PA_TX_BPS=''
+  PA_HRX_BPS=''
+  PA_HTX_BPS=''
+  if [ -n "${PA_HACC_FROM:-}" ]; then
+    _span=$((PA_NOW - PA_HACC_FROM))
+    if [ "$_span" -ge "$PA_HISTORY_MIN_WINDOW" ]; then
+      PA_HRX_BPS=$((PA_HACC_RX * 8 / _span))
+      PA_HTX_BPS=$((PA_HACC_TX * 8 / _span))
+    fi
+  fi
   [ -n "${PA_ACC_FROM:-}" ] || return 0
   _span=$((PA_NOW - PA_ACC_FROM))
   [ "$_span" -ge 5 ] || return 0
@@ -804,14 +829,18 @@ END {
 
   # Traffic history, kept here because there is no server to keep it: the stored
   # samples younger than four hours, this one added when the last is old enough
-  # that a fast-tier burst cannot crowd out the hours, the newest 48 kept.
+  # that a fast-tier burst cannot crowd out the hours, the newest 48 kept. A new
+  # sample is the average since the previous one (avgrx/avgtx), not the rate of this report.
   kept = 0
   for (i = 1; i <= nh; i++) {
     if (hat[i] + 0 <= now && now - hat[i] <= hage * 1000) { kept++; kat[kept] = hat[i]; krx[kept] = hrx[i]; ktx[kept] = htx[i] }
   }
   rx = ENVIRON["PJ_RX"]; tx = ENVIRON["PJ_TX"]
-  if (rx ~ /^[0-9]+$/ && tx ~ /^[0-9]+$/ && (kept == 0 || now - kat[kept] >= hspace * 1000)) {
-    kept++; kat[kept] = ms(now); krx[kept] = rx; ktx[kept] = tx
+  avgrx = ENVIRON["PJ_HRX"]; avgtx = ENVIRON["PJ_HTX"]
+  if (avgrx ~ /^[0-9]+$/ && avgtx ~ /^[0-9]+$/ && (kept == 0 || now - kat[kept] >= hspace * 1000)) {
+    kept++; kat[kept] = ms(now); krx[kept] = avgrx; ktx[kept] = avgtx
+    print ms(now) > histadded
+    close(histadded)
   }
   hist = ""
   for (i = (kept > hmax ? kept - hmax + 1 : 1); i <= kept; i++) {
@@ -987,14 +1016,15 @@ pa_build_report() {
   [ -r "$_prev" ] || _prev=/dev/null
   _hist="$PA_TMP.history"
   [ -r "$_hist" ] || _hist=/dev/null
+  rm -f "$PA_TMP.history.added"
   PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FULFIL=${PA_FULFIL:-0} \
     PJ_BOOTED=$_booted PJ_CPU=${PA_CPU:-} PJ_MU=${PA_MEM_USED:-} PJ_MT=${PA_MEM_TOTAL:-} \
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
-    PJ_RX=${PA_RX_BPS:-} PJ_TX=${PA_TX_BPS:-} \
+    PJ_RX=${PA_RX_BPS:-} PJ_TX=${PA_TX_BPS:-} PJ_HRX=${PA_HRX_BPS:-} PJ_HTX=${PA_HTX_BPS:-} \
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
-      -v histout="$PA_TMP.history.new" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
+      -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
       -v maxc="$PA_MAX_CLIENTS" -v hmax="$PA_HISTORY_MAX" -v hspace="$PA_HISTORY_SPACING" \
       -v hage="$PA_HISTORY_AGE" "$PA_AWK_ESC$PA_AWK_REPORT" \
       "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$PA_TMP.wifi"
@@ -1005,9 +1035,16 @@ pa_build_report() {
 }
 
 # Keeps the history the report just wrote. Separate from building it, so a report
-# that never reached Firebase does not count as a sample.
+# that never reached Firebase does not count as a sample. When it added a point, the
+# next point averages from here.
 pa_keep_history() {
   [ -f "$PA_TMP.history.new" ] && mv -f "$PA_TMP.history.new" "$PA_TMP.history"
+  if [ -f "$PA_TMP.history.added" ]; then
+    rm -f "$PA_TMP.history.added"
+    PA_HACC_RX=0
+    PA_HACC_TX=0
+    PA_HACC_FROM=$PA_NOW
+  fi
   return 0
 }
 
