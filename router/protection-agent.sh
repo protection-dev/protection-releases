@@ -23,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.7.0 (14)"
+PA_AGENT_VERSION="1.8.0 (15)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -48,6 +48,12 @@ PA_MAX_CLIENTS=64
 # that pass is skipped, and the next one under the limit counts what it missed of
 # the connections still open.
 PA_CT_MAX=20000
+# When a wired device joined, which no table on a router records, is when the agent
+# first saw it live. One unseen this long has left, and joins again when it is back.
+# A device already there when the agent first looks, more than PA_JOIN_BOOT after
+# boot, joined at some unknown time before: it gets no time until it joins again.
+PA_JOIN_GAP=600
+PA_JOIN_BOOT=900
 # Traffic history: 48 samples, at least 270 s apart, none older than 4 hours.
 PA_HISTORY_MAX=48
 PA_HISTORY_SPACING=270
@@ -816,6 +822,15 @@ function lanok(dev) {
 # opened it, so the original direction is its upload; r: it was opened to the device
 # (a port forward), so it is its download. Prints the connections with byte counts,
 # those without, and those of devices.
+#
+# The same read says which devices are live: those with a connection in the table, or
+# a neighbour entry the router confirmed lately (REACHABLE, DELAY, PROBE; STALE only
+# means it was there once). $PA_TMP.seen keeps when each live device joined: "@
+# SECONDS" (this read), then "MAC JOINED LASTSEEN", JOINED "-" when it was already there
+# before the agent could tell. A device gone longer than `gap` is dropped, so it joins
+# anew when it is back. A read more than `gap` after the previous one (the agent was
+# stopped or dormant) cannot tell who left: devices it knew keep their time, and new
+# ones get none.
 PA_AWK_CT='
 function hex4(g) { while (length(g) < 4) g = "0" g; return g }
 # An IPv6 address as the connection table prints it: eight groups of four digits.
@@ -846,14 +861,23 @@ FILENAME == arp {
   if (($3 == "0x2" || $3 == "0x6") && macok(m) && lanok($6)) host[$1] = m
   next
 }
-# `ip -6 neigh`: "2a01:e0a::1f dev br-lan lladdr aa:bb:cc:dd:ee:ff STALE".
+# `ip neigh`: "2a01:e0a::1f dev br-lan lladdr aa:bb:cc:dd:ee:ff STALE", and the same
+# for IPv4 addresses.
 FILENAME == neigh {
   ndev = ""; m = ""
   for (i = 2; i < NF; i++) {
     if ($i == "dev") ndev = $(i + 1)
     else if ($i == "lladdr") m = tolower($(i + 1))
   }
-  if (macok(m) && lanok(ndev)) { full = v6full($1); if (full != "") host[full] = m }
+  if (!macok(m) || !lanok(ndev)) next
+  if (index($1, ":") > 0) { full = v6full($1); if (full != "") host[full] = m }
+  else host[$1] = m
+  if ($NF == "REACHABLE" || $NF == "DELAY" || $NF == "PROBE") live[m] = 1
+  next
+}
+FILENAME == seen {
+  if ($1 == "@") seenat = $2
+  else if (macok($1) && NF == 3 && $3 ~ /^[0-9]+$/) { sf[$1] = $2; sl[$1] = $3 }
   next
 }
 FILENAME == prevct {
@@ -889,22 +913,24 @@ FILENAME == ct {
     } else if (ns == 1 && k == "dst") od = v
     if (ns == 1 && k != "packets") key = key "," v
   }
-  if (ob !~ /^[0-9]+$/ || rb !~ /^[0-9]+$/) { nbare++; next }
-  ncount++
+  counts = (ob ~ /^[0-9]+$/ && rb ~ /^[0-9]+$/)
+  if (counts) ncount++; else nbare++
   if (index(os, "::") > 0) os = v6full(os)
   if (index(od, "::") > 0) od = v6full(od)
   if (index(rs, "::") > 0) rs = v6full(rs)
+  if (key in pm) { m = pm[key]; d = pd[key] }
+  else if (os in host) { m = host[os]; d = "o" }
+  else if (rs in host) { m = host[rs]; d = "r" }
+  else if (od in host) { m = host[od]; d = "r" }
+  else next
+  # A connection in the table, counted or not, says the device is there.
+  live[m] = 1
+  if (!counts) next
   if (key in pm) {
-    m = pm[key]; d = pd[key]
     xo = ob - po[key]; xr = rb - pb[key]
     if (xo < 0 || xr < 0) { xo = ob + 0; xr = rb + 0 }
-  } else {
-    if (os in host) { m = host[os]; d = "o" }
-    else if (rs in host) { m = host[rs]; d = "r" }
-    else if (od in host) { m = host[od]; d = "r" }
-    else next
-    if (fresh == "1") { xo = 0; xr = 0 } else { xo = ob + 0; xr = rb + 0 }
-  }
+  } else if (fresh == "1") { xo = 0; xr = 0 }
+  else { xo = ob + 0; xr = rb + 0 }
   nlan++
   printf("%s %s %s %s %s\n", key, m, d, ob, rb) > ctout
   if (d == "o") { aup[m] += xo; adn[m] += xr } else { adn[m] += xo; aup[m] += xr }
@@ -920,6 +946,19 @@ END {
     for (m in adn) printf("%s %.0f %.0f\n", m, adn[m], aup[m]) > accout
     close(accout)
   }
+  # When each live device joined. On the first look of the boot, a device already
+  # there joined with the boot if the boot was recent, else at a time nobody knows.
+  looked = (seenat != "" && now - seenat <= gap)
+  printf("@ %s\n", now) > seenout
+  for (m in live) {
+    if ((m in sf) && (!looked || now - sl[m] <= gap)) j = sf[m]
+    else if (seenat != "") j = looked ? now : "-"
+    else j = (up + 0 <= bootwin + 0) ? now : "-"
+    printf("%s %s %s\n", m, j, now) > seenout
+  }
+  # One not live this time is kept a while: a quiet minute is not leaving.
+  for (m in sf) if (!(m in live) && now - sl[m] <= gap) printf("%s %s %s\n", m, sf[m], sl[m]) > seenout
+  close(seenout)
   printf("%d %d %d\n", ncount, nbare, nlan)
 }
 '
@@ -968,7 +1007,9 @@ pa_ct_sample() {
     return 0
   fi
   _n6=/dev/null
-  if pa_have ip && ip -6 neigh show > "$PA_TMP.n6" 2>/dev/null; then _n6="$PA_TMP.n6"; fi
+  if pa_have ip && ip neigh show > "$PA_TMP.n6" 2>/dev/null; then _n6="$PA_TMP.n6"; fi
+  _seen="$PA_TMP.seen"
+  [ -r "$_seen" ] || _seen=/dev/null
   _arp="$PA_ROOT/proc/net/arp"
   [ -r "$_arp" ] || _arp=/dev/null
   _prev="$PA_TMP.ct"
@@ -981,19 +1022,21 @@ pa_ct_sample() {
   [ -r "$_acc" ] || _acc=/dev/null
   _counting=0
   [ -r "$PA_TMP.usage.since" ] && _counting=1
-  rm -f "$PA_TMP.ct.new" "$PA_TMP.ctacc.new"
+  rm -f "$PA_TMP.ct.new" "$PA_TMP.ctacc.new" "$PA_TMP.seen.new"
   # shellcheck disable=SC2046
-  set -- $(awk -v arp="$_arp" -v neigh="$_n6" -v prevct="$_prev" -v acc="$_acc" -v ct="$PA_CT_FILE" \
-    -v ctout="$PA_TMP.ct.new" -v accout="$PA_TMP.ctacc.new" -v lan="${PA_LAN_DEV:-}" -v wan="${PA_WAN_DEV:-}" \
-    -v now="$PA_WALL" -v fresh="$_fresh" -v counting="$_counting" "$PA_AWK_HOST$PA_AWK_CT" \
-    "$_arp" "$_n6" "$_prev" "$_acc" "$PA_CT_FILE" 2>/dev/null)
+  set -- $(awk -v arp="$_arp" -v neigh="$_n6" -v seen="$_seen" -v prevct="$_prev" -v acc="$_acc" -v ct="$PA_CT_FILE" \
+    -v ctout="$PA_TMP.ct.new" -v accout="$PA_TMP.ctacc.new" -v seenout="$PA_TMP.seen.new" \
+    -v lan="${PA_LAN_DEV:-}" -v wan="${PA_WAN_DEV:-}" -v now="$PA_WALL" -v up="${PA_NOW:-0}" \
+    -v gap="$PA_JOIN_GAP" -v bootwin="$PA_JOIN_BOOT" -v fresh="$_fresh" -v counting="$_counting" \
+    "$PA_AWK_HOST$PA_AWK_CT" "$_arp" "$_n6" "$_seen" "$_prev" "$_acc" "$PA_CT_FILE" 2>/dev/null)
   rm -f "$PA_TMP.n6"
   if ! pa_isnum "${1:-}" || ! pa_isnum "${2:-}" || ! pa_isnum "${3:-}"; then
-    rm -f "$PA_TMP.ct.new" "$PA_TMP.ctacc.new"
+    rm -f "$PA_TMP.ct.new" "$PA_TMP.ctacc.new" "$PA_TMP.seen.new"
     return 0
   fi
   mv -f "$PA_TMP.ct.new" "$PA_TMP.ct"
   [ -f "$PA_TMP.ctacc.new" ] && mv -f "$PA_TMP.ctacc.new" "$PA_TMP.ctacc"
+  [ -f "$PA_TMP.seen.new" ] && mv -f "$PA_TMP.seen.new" "$PA_TMP.seen"
   PA_CT_FLOWS=$1
   # Counts on any connection, or the switch on (connections opened before it was
   # turned on carry none): counting. Neither: the kernel keeps no counts.
@@ -1119,6 +1162,12 @@ FILENAME == ctacc {
   else if (macok($1) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) { cdn[$1] = $2; cup[$1] = $3 }
   next
 }
+# When the agent saw each device join, from its reads of the tables: "MAC SECONDS
+# LASTSEEN", or "-" for one that was there before it could tell.
+FILENAME == joins {
+  if (macok($1) && $2 ~ /^[0-9]+$/) jfirst[$1] = $2
+  next
+}
 FILENAME == history {
   if ($1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) { nh++; hat[nh] = $1; hrx[nh] = $2; htx[nh] = $3 }
   next
@@ -1238,7 +1287,7 @@ END {
     if ((m in wband) || cdn[m] + cup[m] == 0) continue
     k = hour " " m; udn[k] += cdn[m]; uup[k] += cup[m]
   }
-  for (i = 1; i <= n; i++) if (!(order[i] in wband)) nwired++
+  for (i = 1; i <= n; i++) if (!(order[i] in wband)) { nwired++; if (order[i] in jfirst) nwjoin++ }
   for (k in udn) {
     split(k, kk, " ")
     if (kk[1] + 0 > hour - 24 && kk[1] + 0 <= hour) {
@@ -1257,8 +1306,10 @@ END {
     x = put(x, "ip", fstr((m in aip) ? aip[m] : lip[m]))
     x = put(x, "band", fstr(bandname((m in wband) ? wband[m] : "")))
     x = put(x, "signalDbm", fint(wsig[m]))
-    if (wct[m] ~ /^[0-9]+$/) x = put(x, "connectedSince", fint(ms(now - wct[m] * 1000)))
     wired = !(m in wband)
+    if (wct[m] ~ /^[0-9]+$/) x = put(x, "connectedSince", fint(ms(now - wct[m] * 1000)))
+    # A wired device: when the agent saw it join, since no table on a router keeps that.
+    else if (wired && (m in jfirst)) x = put(x, "connectedSince", fint(ms(jfirst[m] * 1000)))
     if (wired && ctok && cdt > 0 && cdt <= 3600) {
       rdn[m] = sprintf("%.0f", cdn[m] * 8 / cdt); rup[m] = sprintf("%.0f", cup[m] * 8 / cdt)
     }
@@ -1338,7 +1389,7 @@ END {
   if (ctok) caps = capadd(caps, "WIRED_CLIENT_DATA")
   rt = put(rt, "capabilities", farr(caps))
   if (probeout != "") {
-    printf("stations %d\nsignal %d\ndata %d\nrate %d\nradios %d\nairtime %d\nwired %d\n", nsta, nsig, ndata, nrate, nr, nsurv, nwired) > probeout
+    printf("stations %d\nsignal %d\ndata %d\nrate %d\nradios %d\nairtime %d\nwired %d\nwiredjoin %d\n", nsta, nsig, ndata, nrate, nr, nsurv, nwired, nwjoin) > probeout
     close(probeout)
   }
   # This agent answers an Update from the owner: the apps offer one only to an agent that says so.
@@ -1736,6 +1787,8 @@ pa_build_report() {
   [ -r "$_use" ] || _use=/dev/null
   _cta="$PA_TMP.ctacc"
   [ -r "$_cta" ] || _cta=/dev/null
+  _joins="$PA_TMP.seen"
+  [ -r "$_joins" ] || _joins=/dev/null
   # When this boot began counting each device's data: the 24 hours shrink to
   # "since then" until a day has passed. In RAM, so a reboot starts again.
   [ -r "$PA_TMP.usage.since" ] || printf '%s\n' "$PA_WALL" > "$PA_TMP.usage.since"
@@ -1783,11 +1836,11 @@ pa_build_report() {
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
       -v prevsta="$_sta" -v staout="$PA_TMP.sta.new" -v usage="$_use" -v usageout="$PA_TMP.usage.new" \
-      -v ctacc="$_cta" -v probeout="${PA_PROBE_OUT:-}" \
+      -v ctacc="$_cta" -v joins="$_joins" -v probeout="${PA_PROBE_OUT:-}" \
       -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
       -v maxc="$PA_MAX_CLIENTS" -v hmax="$PA_HISTORY_MAX" -v hspace="$PA_HISTORY_SPACING" \
       -v hage="$PA_HISTORY_AGE" "$PA_AWK_ESC$PA_AWK_HOST$PA_AWK_REPORT" \
-      "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$_sta" "$_use" "$_cta" "$PA_TMP.wifi"
+      "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$_sta" "$_use" "$_cta" "$_joins" "$PA_TMP.wifi"
   _rc=$?
   [ -f "$PA_TMP.survey.new" ] && mv -f "$PA_TMP.survey.new" "$PA_TMP.survey"
   # The counters and the buckets they fed move on together, written or not: the
@@ -3035,7 +3088,7 @@ pa_doctor() {
   rm -f "$PA_PROBE_OUT" "$PA_PROBE_OUT.wifi"
   pa_build_report > /dev/null
   rm -f "$PA_TMP.history.new"
-  _stations=0 _signal=0 _data=0 _rate=0 _radios=0 _airtime=0 _wired=0
+  _stations=0 _signal=0 _data=0 _rate=0 _radios=0 _airtime=0 _wired=0 _wjoin=0
   if [ -r "$PA_PROBE_OUT" ]; then
     while read -r _k _v; do
       pa_isnum "$_v" || continue
@@ -3047,6 +3100,7 @@ pa_doctor() {
         radios) _radios=$_v ;;
         airtime) _airtime=$_v ;;
         wired) _wired=$_v ;;
+        wiredjoin) _wjoin=$_v ;;
       esac
     done < "$PA_PROBE_OUT"
   fi
@@ -3106,6 +3160,17 @@ pa_doctor() {
     *) _ct="no data used: this firmware has no connection table to read" ;;
   esac
   pa_doc Wired: "$_wired device(s), $_ct"
+  # When each joined: seen by the agent itself, so one already there when it began
+  # watching (long after boot) has no time until it joins again.
+  if [ "$_wired" -gt 0 ]; then
+    case ${PA_CT_STATE:-none} in
+      ok | off)
+        _jn="$_wjoin of $_wired devices"
+        [ "$_wjoin" -lt "$_wired" ] && _jn="$_jn (the others were connected before the agent began watching; they get a time when they next join)"
+        pa_doc "  joined" "$_jn"
+        ;;
+    esac
+  fi
   case ${PA_CT_STATE:-none} in
     ok | busy) ;;
     *) [ "$_wired" -gt 0 ] && _missing="$_missing, data per wired device" ;;
