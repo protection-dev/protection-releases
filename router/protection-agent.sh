@@ -13,7 +13,8 @@
 #
 # Written for BusyBox ash and BusyBox awk: POSIX only, no bashisms. It sleeps
 # between contacts, reads /proc and /sys with shell builtins, and does its parsing
-# in one awk pass per report. It signs in to Firebase anonymously, the way the
+# in one awk pass per report (plus one over the connection table per contact, for
+# the data wired devices use). It signs in to Firebase anonymously, the way the
 # Windows client does, and Firestore's rules let it write nothing but its own
 # device document. PROJECT and KEY are the app's own public Firebase client
 # settings. It needs curl, which setup installs on OpenWrt when it is missing.
@@ -22,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.6.0 (13)"
+PA_AGENT_VERSION="1.7.0 (14)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -42,6 +43,11 @@ PA_BACKOFF_MAX=300
 # A contact failure that lasts this long counts as an internet outage.
 PA_OUTAGE_MIN=90
 PA_MAX_CLIENTS=64
+# The most connections the agent reads in one pass of the connection table (for the
+# data wired devices use). A bigger table takes seconds to read on a small router;
+# that pass is skipped, and the next one under the limit counts what it missed of
+# the connections still open.
+PA_CT_MAX=20000
 # Traffic history: 48 samples, at least 270 s apart, none older than 4 hours.
 PA_HISTORY_MAX=48
 PA_HISTORY_SPACING=270
@@ -204,7 +210,7 @@ pa_init_platform() {
 pa_nvram_snapshot() {
   [ "$PA_PLATFORM" = merlin ] || return 0
   nvram show 2>/dev/null | awk -F= '
-    /^(wan_primary|wan[01]_(ifname|proto|ipaddr)|wl[0-3]_(ifname|nband|ssid|radio)|wl[0-3]\.[1-3]_bss_enabled|lan_ifname|productid|odmpid|buildno|extendno|firmver|lan_hwaddr|jffs2_scripts|custom_clientlist)=/ {
+    /^(wan_primary|wan[01]_(ifname|proto|ipaddr)|wl[0-3]_(ifname|nband|ssid|radio)|wl[0-3]\.[1-3]_bss_enabled|lan_ifname|productid|odmpid|buildno|extendno|firmver|lan_hwaddr|jffs2_scripts|custom_clientlist|ctf_disable)=/ {
       key = $1; gsub(/\./, "_", key)
       print key "=" substr($0, length($1) + 2)
     }' > "$PA_TMP.nv" 2>/dev/null
@@ -776,6 +782,230 @@ pa_static_names() {
   esac
 }
 
+# Which addresses are devices on the LAN, for both awk programs that read the ARP
+# table. `lan` and `wan` are the LAN bridge and the WAN device: an entry on the WAN
+# (the ISP's gateway) or on a container bridge is not a device of the home's.
+PA_AWK_HOST='
+function macok(m) { return m ~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])$/ && m != "00:00:00:00:00:00" }
+function lanok(dev) {
+  if (dev == "" || index(" " wan " ", " " dev " ") > 0) return 0
+  if (dev ~ /^br-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) return 0
+  if (lan != "" && dev == lan) return 1
+  return dev ~ /^br/
+}
+'
+
+# -- Wired devices -------------------------------------------------------------------
+# A wired device has no station table to read its bytes from, so its data comes from
+# the connection table instead (conntrack): for every connection through the router,
+# the kernel keeps the bytes each way. A connection leaves the table soon after it
+# ends (two minutes after a TCP close, half a minute to three for UDP), so it is read at
+# every contact, not every report: once a minute, nearly every connection is seen
+# with its final count. What each connection grew by since the previous read goes to
+# the device at its LAN end, found by its IPv4 address (ARP) or IPv6 address (the
+# neighbour table), and adds up in $PA_TMP.ctacc until the next report puts it in
+# that device's hourly bucket. What a device sends straight to another at home is
+# switched, never routed, so it is not in the table and not counted.
+#
+# $PA_TMP.ct holds the previous read: "@ SECONDS", then one line per connection of a
+# device ("KEY MAC DIRECTION ORIGBYTES REPLYBYTES"). KEY is the protocol and the
+# original direction (addresses, ports), the same for a connection's whole life. A
+# connection the previous read did not have opened since then, and all of it counts;
+# on the first read of the boot, nothing does. A count that went down belongs to a
+# new connection that reused the same addresses and ports. DIRECTION o: the device
+# opened it, so the original direction is its upload; r: it was opened to the device
+# (a port forward), so it is its download. Prints the connections with byte counts,
+# those without, and those of devices.
+PA_AWK_CT='
+function hex4(g) { while (length(g) < 4) g = "0" g; return g }
+# An IPv6 address as the connection table prints it: eight groups of four digits.
+function v6full(a,    p, l, r, nl, nr, lp, rp, out, sep, i) {
+  a = tolower(a); sub(/%.*/, "", a)
+  if (a !~ /^[0-9a-f:]+$/) return ""
+  out = ""; sep = ""
+  p = index(a, "::")
+  if (p == 0) {
+    if (split(a, lp, ":") != 8) return ""
+    for (i = 1; i <= 8; i++) { out = out sep hex4(lp[i]); sep = ":" }
+    return out
+  }
+  l = substr(a, 1, p - 1); r = substr(a, p + 2)
+  if (index(r, "::") > 0) return ""
+  nl = (l == "") ? 0 : split(l, lp, ":")
+  nr = (r == "") ? 0 : split(r, rp, ":")
+  if (nl + nr > 7) return ""
+  for (i = 1; i <= nl; i++) { out = out sep hex4(lp[i]); sep = ":" }
+  for (i = 1; i <= 8 - nl - nr; i++) { out = out sep "0000"; sep = ":" }
+  for (i = 1; i <= nr; i++) { out = out sep hex4(rp[i]); sep = ":" }
+  return out
+}
+BEGIN { printf("@ %s\n", now) > ctout }
+FILENAME == arp {
+  if (FNR == 1) next
+  m = tolower($4)
+  if (($3 == "0x2" || $3 == "0x6") && macok(m) && lanok($6)) host[$1] = m
+  next
+}
+# `ip -6 neigh`: "2a01:e0a::1f dev br-lan lladdr aa:bb:cc:dd:ee:ff STALE".
+FILENAME == neigh {
+  ndev = ""; m = ""
+  for (i = 2; i < NF; i++) {
+    if ($i == "dev") ndev = $(i + 1)
+    else if ($i == "lladdr") m = tolower($(i + 1))
+  }
+  if (macok(m) && lanok(ndev)) { full = v6full($1); if (full != "") host[full] = m }
+  next
+}
+FILENAME == prevct {
+  if ($1 == "@") prevat = $2
+  else if (NF == 5) { pm[$1] = $2; pd[$1] = $3; po[$1] = $4; pb[$1] = $5 }
+  next
+}
+FILENAME == acc {
+  if ($1 == "@") from = $2
+  else if (macok($1) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) { adn[$1] += $2; aup[$1] += $3 }
+  next
+}
+# "ipv4 2 tcp 6 117 ESTABLISHED src=A dst=B sport=P dport=Q packets=N bytes=N
+# src=B dst=A sport=Q dport=P packets=N bytes=N [ASSURED] mark=0 use=1", or the
+# same without the first two fields from an old kernel ip_conntrack. No bytes=
+# when the kernel keeps no counts.
+FILENAME == ct {
+  proto = ($1 ~ /^ipv[46]$/) ? $3 : $1
+  key = proto; ns = 0; os = ""; od = ""; rs = ""; ob = ""; rb = ""
+  for (i = 2; i <= NF; i++) {
+    e = index($i, "=")
+    if (e == 0) continue
+    k = substr($i, 1, e - 1); v = substr($i, e + 1)
+    if (k == "src") {
+      ns++
+      if (ns == 1) os = v
+      else if (ns == 2) rs = v
+      else break
+    } else if (k == "bytes") {
+      if (ns == 1) { ob = v; continue }
+      rb = v
+      break
+    } else if (ns == 1 && k == "dst") od = v
+    if (ns == 1 && k != "packets") key = key "," v
+  }
+  if (ob !~ /^[0-9]+$/ || rb !~ /^[0-9]+$/) { nbare++; next }
+  ncount++
+  if (index(os, "::") > 0) os = v6full(os)
+  if (index(od, "::") > 0) od = v6full(od)
+  if (index(rs, "::") > 0) rs = v6full(rs)
+  if (key in pm) {
+    m = pm[key]; d = pd[key]
+    xo = ob - po[key]; xr = rb - pb[key]
+    if (xo < 0 || xr < 0) { xo = ob + 0; xr = rb + 0 }
+  } else {
+    if (os in host) { m = host[os]; d = "o" }
+    else if (rs in host) { m = host[rs]; d = "r" }
+    else if (od in host) { m = host[od]; d = "r" }
+    else next
+    if (fresh == "1") { xo = 0; xr = 0 } else { xo = ob + 0; xr = rb + 0 }
+  }
+  nlan++
+  printf("%s %s %s %s %s\n", key, m, d, ob, rb) > ctout
+  if (d == "o") { aup[m] += xo; adn[m] += xr } else { adn[m] += xo; aup[m] += xr }
+  next
+}
+END {
+  close(ctout)
+  # Counting begins with the first report of the boot; until then this only keeps
+  # the table, as the starting point. The window starts at the read before this one.
+  if (counting == "1") {
+    if (from == "") from = (prevat != "") ? prevat : now
+    printf("@ %s\n", from) > accout
+    for (m in adn) printf("%s %.0f %.0f\n", m, adn[m], aup[m]) > accout
+    close(accout)
+  }
+  printf("%d %d %d\n", ncount, nbare, nlan)
+}
+'
+
+# The connection table: nf_conntrack, or the ip_conntrack an old kernel still has.
+pa_ct_file() {
+  PA_CT_FILE=''
+  for _f in "$PA_ROOT/proc/net/nf_conntrack" "$PA_ROOT/proc/net/ip_conntrack"; do
+    if [ -r "$_f" ]; then
+      PA_CT_FILE=$_f
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The kernel counts bytes per connection only when told to. OpenWrt tells it at
+# boot; other firmware may not, and without the counts no wired device has figures.
+# The service turns them on: a runtime switch, in RAM, which a reboot turns off
+# again until the service starts and turns it back on. Connections open before then
+# carry no counts. Marked, so uninstall can put it back.
+pa_ct_enable() {
+  _acct="$PA_ROOT/proc/sys/net/netfilter/nf_conntrack_acct"
+  pa_read _v "$_acct" || return 0
+  [ "$_v" = 0 ] || return 0
+  if printf '1\n' 2>/dev/null > "$_acct"; then
+    : > "$PA_TMP.acct-on"
+    pa_log "turned on connection byte counting, for the data wired devices use"
+  fi
+  return 0
+}
+
+# One read of the connection table. Sets PA_CT_STATE: ok (counted), busy (too big to
+# read this time), off (the kernel keeps no byte counts) or none (no table), and
+# PA_CT_FLOWS, the connections it had. PA_CT_FRESH tells the report this read is
+# this contact's, so it does not read the table again.
+pa_ct_sample() {
+  PA_CT_FRESH=1
+  PA_CT_STATE=none
+  PA_CT_FLOWS=0
+  pa_ct_file || return 0
+  pa_read _ctn "$PA_ROOT/proc/sys/net/netfilter/nf_conntrack_count"
+  if pa_isnum "$_ctn" && [ "$_ctn" -gt "$PA_CT_MAX" ]; then
+    PA_CT_STATE=busy
+    PA_CT_FLOWS=$_ctn
+    return 0
+  fi
+  _n6=/dev/null
+  if pa_have ip && ip -6 neigh show > "$PA_TMP.n6" 2>/dev/null; then _n6="$PA_TMP.n6"; fi
+  _arp="$PA_ROOT/proc/net/arp"
+  [ -r "$_arp" ] || _arp=/dev/null
+  _prev="$PA_TMP.ct"
+  _fresh=0
+  if [ ! -r "$_prev" ]; then
+    _prev=/dev/null
+    _fresh=1
+  fi
+  _acc="$PA_TMP.ctacc"
+  [ -r "$_acc" ] || _acc=/dev/null
+  _counting=0
+  [ -r "$PA_TMP.usage.since" ] && _counting=1
+  rm -f "$PA_TMP.ct.new" "$PA_TMP.ctacc.new"
+  # shellcheck disable=SC2046
+  set -- $(awk -v arp="$_arp" -v neigh="$_n6" -v prevct="$_prev" -v acc="$_acc" -v ct="$PA_CT_FILE" \
+    -v ctout="$PA_TMP.ct.new" -v accout="$PA_TMP.ctacc.new" -v lan="${PA_LAN_DEV:-}" -v wan="${PA_WAN_DEV:-}" \
+    -v now="$PA_WALL" -v fresh="$_fresh" -v counting="$_counting" "$PA_AWK_HOST$PA_AWK_CT" \
+    "$_arp" "$_n6" "$_prev" "$_acc" "$PA_CT_FILE" 2>/dev/null)
+  rm -f "$PA_TMP.n6"
+  if ! pa_isnum "${1:-}" || ! pa_isnum "${2:-}" || ! pa_isnum "${3:-}"; then
+    rm -f "$PA_TMP.ct.new" "$PA_TMP.ctacc.new"
+    return 0
+  fi
+  mv -f "$PA_TMP.ct.new" "$PA_TMP.ct"
+  [ -f "$PA_TMP.ctacc.new" ] && mv -f "$PA_TMP.ctacc.new" "$PA_TMP.ctacc"
+  PA_CT_FLOWS=$1
+  # Counts on any connection, or the switch on (connections opened before it was
+  # turned on carry none): counting. Neither: the kernel keeps no counts.
+  pa_read _acct "$PA_ROOT/proc/sys/net/netfilter/nf_conntrack_acct"
+  if [ "$1" -gt 0 ] || [ "$_acct" = 1 ]; then
+    PA_CT_STATE=ok
+  else
+    PA_CT_STATE=off
+  fi
+  return 0
+}
+
 
 # -- The report --------------------------------------------------------------------
 
@@ -816,14 +1046,7 @@ function bandname(b) {
   if (b == "w") return "WIRED"
   return ""
 }
-function macok(m) { return m ~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])$/ && m != "00:00:00:00:00:00" }
 function remember(m) { if (!(m in known)) { known[m] = 1; order[++n] = m } }
-function lanok(dev) {
-  if (dev == "" || index(" " wan " ", " " dev " ") > 0) return 0
-  if (dev ~ /^br-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/) return 0
-  if (lan != "" && dev == lan) return 1
-  return dev ~ /^br/
-}
 function flush() {
   if (cur != "" && macok(cur)) {
     sig = (savg != "") ? savg : ((ssig != "") ? ssig : santa)
@@ -887,6 +1110,13 @@ FILENAME == prevsta {
 }
 FILENAME == usage {
   if ($1 ~ /^[0-9]+$/ && macok($2) && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/) { k = $1 " " $2; udn[k] += $3; uup[k] += $4 }
+  next
+}
+# What the connections of each device moved since the previous report, from the
+# connection table: "@ SECONDS" (when that window began), then "MAC DOWN UP".
+FILENAME == ctacc {
+  if ($1 == "@" && $2 ~ /^[0-9]+$/) ctfrom = $2 + 0
+  else if (macok($1) && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/) { cdn[$1] = $2; cup[$1] = $3 }
   next
 }
 FILENAME == history {
@@ -999,6 +1229,16 @@ END {
     printf("%s %s %s %s %s\n", m, wdn[m], wup[m], wct[m], nows) > staout
   }
   close(staout)
+  # Every device on none of the radios (wired, or behind an extender) the same way,
+  # from what its connections moved since the previous report. A device on a radio
+  # is counted by its station counters above, never twice.
+  ctok = (ENVIRON["PJ_CT"] == "ok" || ENVIRON["PJ_CT"] == "busy")
+  cdt = (ctfrom > 0) ? nows - ctfrom : 0
+  for (m in cdn) {
+    if ((m in wband) || cdn[m] + cup[m] == 0) continue
+    k = hour " " m; udn[k] += cdn[m]; uup[k] += cup[m]
+  }
+  for (i = 1; i <= n; i++) if (!(order[i] in wband)) nwired++
   for (k in udn) {
     split(k, kk, " ")
     if (kk[1] + 0 > hour - 24 && kk[1] + 0 <= hour) {
@@ -1018,9 +1258,13 @@ END {
     x = put(x, "band", fstr(bandname((m in wband) ? wband[m] : "")))
     x = put(x, "signalDbm", fint(wsig[m]))
     if (wct[m] ~ /^[0-9]+$/) x = put(x, "connectedSince", fint(ms(now - wct[m] * 1000)))
+    wired = !(m in wband)
+    if (wired && ctok && cdt > 0 && cdt <= 3600) {
+      rdn[m] = sprintf("%.0f", cdn[m] * 8 / cdt); rup[m] = sprintf("%.0f", cup[m] * 8 / cdt)
+    }
     x = put(x, "downBps", fint(rdn[m]))
     x = put(x, "upBps", fint(rup[m]))
-    if (m in wdn) {
+    if ((m in wdn) || (wired && ctok)) {
       x = put(x, "downBytes24h", fint(sprintf("%.0f", tdn[m] + 0)))
       x = put(x, "upBytes24h", fint(sprintf("%.0f", tup[m] + 0)))
     }
@@ -1083,16 +1327,18 @@ END {
   # What this router lets the agent measure, so the apps can say what it cannot
   # rather than leave a figure blank. From what the tools gave, before any of it
   # was filtered: a device whose link rates were all keep-alives still has them.
-  # The client ones are only known while a Wi-Fi device is connected.
+  # The Wi-Fi client ones are only known while a Wi-Fi device is connected; the
+  # wired one is the connection table itself, so it is known with nobody wired.
   caps = ""
   if (ENVIRON["PJ_TC"] != "") caps = capadd(caps, "TEMPERATURE")
   if (nsurv > 0) caps = capadd(caps, "AIRTIME")
   if (nsig > 0) caps = capadd(caps, "CLIENT_SIGNAL")
   if (ndata > 0) caps = capadd(caps, "CLIENT_DATA")
   if (nrate > 0) caps = capadd(caps, "CLIENT_LINK_RATE")
+  if (ctok) caps = capadd(caps, "WIRED_CLIENT_DATA")
   rt = put(rt, "capabilities", farr(caps))
   if (probeout != "") {
-    printf("stations %d\nsignal %d\ndata %d\nrate %d\nradios %d\nairtime %d\n", nsta, nsig, ndata, nrate, nr, nsurv) > probeout
+    printf("stations %d\nsignal %d\ndata %d\nrate %d\nradios %d\nairtime %d\nwired %d\n", nsta, nsig, ndata, nrate, nr, nsurv, nwired) > probeout
     close(probeout)
   }
   # This agent answers an Update from the owner: the apps offer one only to an agent that says so.
@@ -1445,6 +1691,10 @@ pa_build_report() {
   pa_static_names
   pa_wifi
   pa_wall
+  # The service has just read the connection table for this contact; a dry run reads
+  # it here.
+  [ "${PA_CT_FRESH:-0}" = 1 ] || pa_ct_sample
+  PA_CT_FRESH=0
   pa_ipinfo
   pa_wifigeo
   pa_ms _nowms "$PA_WALL"
@@ -1484,6 +1734,8 @@ pa_build_report() {
   [ -r "$_sta" ] || _sta=/dev/null
   _use="$PA_TMP.usage"
   [ -r "$_use" ] || _use=/dev/null
+  _cta="$PA_TMP.ctacc"
+  [ -r "$_cta" ] || _cta=/dev/null
   # When this boot began counting each device's data: the 24 hours shrink to
   # "since then" until a day has passed. In RAM, so a reboot starts again.
   [ -r "$PA_TMP.usage.since" ] || printf '%s\n' "$PA_WALL" > "$PA_TMP.usage.since"
@@ -1527,23 +1779,25 @@ pa_build_report() {
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
     PJ_RX=${PA_RX_BPS:-} PJ_TX=${PA_TX_BPS:-} PJ_HRX=${PA_HRX_BPS:-} PJ_HTX=${PA_HTX_BPS:-} \
-    PJ_LAT=$_plat PJ_LON=$_plon PJ_ACC=$_pacc PJ_PSRC=$_psrc PJ_USINCE=$_usince \
+    PJ_LAT=$_plat PJ_LON=$_plon PJ_ACC=$_pacc PJ_PSRC=$_psrc PJ_USINCE=$_usince PJ_CT=${PA_CT_STATE:-none} \
     awk -v leases="$PA_LEASES" -v names="$PA_TMP.names" -v arp="$_arp" -v wifi="$PA_TMP.wifi" \
       -v prevsurvey="$_prev" -v surveyout="$PA_TMP.survey.new" -v history="$_hist" \
       -v prevsta="$_sta" -v staout="$PA_TMP.sta.new" -v usage="$_use" -v usageout="$PA_TMP.usage.new" \
-      -v probeout="${PA_PROBE_OUT:-}" \
+      -v ctacc="$_cta" -v probeout="${PA_PROBE_OUT:-}" \
       -v histout="$PA_TMP.history.new" -v histadded="$PA_TMP.history.added" -v lan="$PA_LAN_DEV" -v wan="$PA_WAN_DEV" \
       -v maxc="$PA_MAX_CLIENTS" -v hmax="$PA_HISTORY_MAX" -v hspace="$PA_HISTORY_SPACING" \
-      -v hage="$PA_HISTORY_AGE" "$PA_AWK_ESC$PA_AWK_REPORT" \
-      "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$_sta" "$_use" "$PA_TMP.wifi"
+      -v hage="$PA_HISTORY_AGE" "$PA_AWK_ESC$PA_AWK_HOST$PA_AWK_REPORT" \
+      "$PA_LEASES" "$PA_TMP.names" "$_arp" "$_prev" "$_hist" "$_sta" "$_use" "$_cta" "$PA_TMP.wifi"
   _rc=$?
   [ -f "$PA_TMP.survey.new" ] && mv -f "$PA_TMP.survey.new" "$PA_TMP.survey"
   # The counters and the buckets they fed move on together, written or not: the
   # bytes are counted where they belong whether or not this report reaches Firebase.
-  # No buckets left means every device aged out of the day.
+  # No buckets left means every device aged out of the day. The wired devices'
+  # window is in the buckets now, so the next one starts empty.
   if [ "$_rc" = 0 ]; then
     [ -f "$PA_TMP.sta.new" ] && mv -f "$PA_TMP.sta.new" "$PA_TMP.sta"
     if [ -f "$PA_TMP.usage.new" ]; then mv -f "$PA_TMP.usage.new" "$PA_TMP.usage"; else rm -f "$PA_TMP.usage"; fi
+    rm -f "$PA_TMP.ctacc"
   fi
   rm -f "$PA_TMP.sta.new" "$PA_TMP.usage.new"
   [ -n "${PA_PROBE_OUT:-}" ] && cp "$PA_TMP.wifi" "$PA_PROBE_OUT.wifi" 2>/dev/null
@@ -2178,9 +2432,11 @@ pa_run() {
   pa_nvram_snapshot
   pa_identity
   pa_wan
+  pa_lan_device
   pa_clock
   pa_accumulate
   pa_cpu
+  pa_ct_enable
   # Fresh from an update (or back from one that failed): may hand over to the
   # agent this one replaced, here and now.
   pa_trial_begin
@@ -2208,6 +2464,7 @@ pa_run() {
       continue
     fi
     pa_accumulate
+    pa_ct_sample
     if pa_contact; then
       pa_clock
       pa_wall
@@ -2718,6 +2975,8 @@ pa_wifipos() {
 pa_uninstall() {
   pa_stop
   pa_autostart_off
+  # Connection byte counting goes back off if the agent was what turned it on.
+  [ -f "$PA_TMP.acct-on" ] && printf '0\n' 2>/dev/null > "$PA_ROOT/proc/sys/net/netfilter/nf_conntrack_acct"
   rm -f "$PA_CONF" "$PA_TMP".*
   case $PA_PLATFORM in
     merlin) rm -rf "$PA_HOME" ;;
@@ -2776,7 +3035,7 @@ pa_doctor() {
   rm -f "$PA_PROBE_OUT" "$PA_PROBE_OUT.wifi"
   pa_build_report > /dev/null
   rm -f "$PA_TMP.history.new"
-  _stations=0 _signal=0 _data=0 _rate=0 _radios=0 _airtime=0
+  _stations=0 _signal=0 _data=0 _rate=0 _radios=0 _airtime=0 _wired=0
   if [ -r "$PA_PROBE_OUT" ]; then
     while read -r _k _v; do
       pa_isnum "$_v" || continue
@@ -2787,6 +3046,7 @@ pa_doctor() {
         rate) _rate=$_v ;;
         radios) _radios=$_v ;;
         airtime) _airtime=$_v ;;
+        wired) _wired=$_v ;;
       esac
     done < "$PA_PROBE_OUT"
   fi
@@ -2802,7 +3062,7 @@ pa_doctor() {
   pa_doc Platform: "$PA_PLATFORM${_bb:+, $_bb}, $_bits-bit shell numbers"
   if pa_load_conf 2>/dev/null; then pa_doc Enrolled: "yes (Firebase project $PA_PROJECT)"; else pa_doc Enrolled: no; fi
   _tools=''
-  for _t in curl iw wl nvram uci; do
+  for _t in curl iw wl nvram uci ip; do
     if pa_have "$_t"; then _tools="$_tools $_t yes,"; else _tools="$_tools $_t no,"; fi
   done
   _tools=${_tools%,}
@@ -2837,6 +3097,38 @@ pa_doctor() {
     [ "$_rate" -gt 0 ] || _missing="$_missing, link speed per device"
   else
     pa_say "  (connect a Wi-Fi device to see what the driver gives per device)"
+  fi
+  # Wired devices: their data comes from the connection table, not a driver.
+  case ${PA_CT_STATE:-none} in
+    ok) _ct="data used from the connection table ($PA_CT_FLOWS connections counted)" ;;
+    busy) _ct="data used, but the connection table is too big to read now ($PA_CT_FLOWS connections, over $PA_CT_MAX)" ;;
+    off) _ct="no data used: the router keeps no byte counts per connection (the agent turns them on when it starts)" ;;
+    *) _ct="no data used: this firmware has no connection table to read" ;;
+  esac
+  pa_doc Wired: "$_wired device(s), $_ct"
+  case ${PA_CT_STATE:-none} in
+    ok | busy) ;;
+    *) [ "$_wired" -gt 0 ] && _missing="$_missing, data per wired device" ;;
+  esac
+  # Connections a router hands to its NAT accelerator skip the counting, which is
+  # worth knowing before trusting a small figure.
+  _accel=''
+  case $PA_PLATFORM in
+    merlin)
+      pa_nv ctf_disable
+      [ "$PA_V" = 0 ] && _accel='NAT acceleration'
+      ;;
+    openwrt)
+      if pa_have uci; then
+        _accel=$(uci -q show firewall 2>/dev/null | awk -F= '
+          $1 ~ /\.flow_offloading_hw$/ && $2 ~ /1/ { hw = 1 }
+          $1 ~ /\.flow_offloading$/ && $2 ~ /1/ { sw = 1 }
+          END { if (hw) print "hardware flow offloading"; else if (sw) print "flow offloading" }')
+      fi
+      ;;
+  esac
+  if [ -n "$_accel" ] && [ "${PA_CT_STATE:-none}" = ok ]; then
+    pa_say "  ($_accel is on: connections it speeds up can be counted short)"
   fi
   if [ -n "$_missing" ]; then pa_doc Unavailable: "${_missing#, }"; else pa_doc Unavailable: "nothing missing"; fi
   # One station, as the driver printed it, every MAC address hidden.
