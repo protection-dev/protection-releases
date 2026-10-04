@@ -23,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.8.0 (15)"
+PA_AGENT_VERSION="1.8.1 (16)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -1188,9 +1188,14 @@ FILENAME == wifi {
   if ($1 == "Station") { flush(); cur = tolower($2); mode = "iw"; next }
   # Broadcom `wl chanim_stats`: a header naming the columns, then one sample per
   # line, the newest last. The channel was busy for whatever share was not idle.
+  # A sample starts with its chanspec: in hex on older drivers (0x1006, the
+  # RT-N18U), as the channel itself from version 4 on (11, 36/80, the RT-AX86U
+  # Pro). Version 4 also runs its busy column into the timestamp ("17" "18306624"
+  # printed as 1718306624), so busy is worked out from idle, which stays put. Two
+  # patterns, not /^(0x)?[0-9]/: GNU awk 5.4 matches that only when the 0x is there.
   if (mode == "chanim") {
     if ($1 == "chanspec") { for (i = 1; i <= NF; i++) if ($i == "idle") cidx = i }
-    else if (cidx > 0 && $1 ~ /^0x/ && $cidx ~ /^[0-9]+$/) {
+    else if (cidx > 0 && ($1 ~ /^0x/ || $1 ~ /^[0-9]/) && $cidx ~ /^[0-9]+$/) {
       v = 100 - $cidx; if (v < 0) v = 0; if (v > 100) v = 100
       cbusy[cif] = v
     }
