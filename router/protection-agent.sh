@@ -23,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.8.1 (16)"
+PA_AGENT_VERSION="1.8.2 (17)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -261,6 +261,9 @@ pa_identity() {
       _bn=$PA_V
       pa_nv extendno
       _ex=$PA_V
+      # As the router's own web UI writes it (state.js): no suffix for an extendno
+      # of 0, so 3006.102.9 rather than 3006.102.9_0.
+      [ "$_ex" = 0 ] && _ex=''
       _flavour=Asuswrt
       [ -x "$PA_ROOT/usr/sbin/helper.sh" ] && _flavour=Asuswrt-Merlin
       PA_FW="$_flavour $_fv.$_bn${_ex:+_$_ex}"
