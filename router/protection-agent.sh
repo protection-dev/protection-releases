@@ -1073,9 +1073,10 @@ function esc(s,    out, i, c) {
 '
 
 # The awk pass that turns everything into the Firestore write: the router map
-# (keys from FirestoreSchema.Router), plus lastSeenAt and appVersion. Strings from
-# the network (hostnames, SSIDs) only reach JSON through esc(); scalars arrive in
-# the environment rather than via -v, which would interpret their backslashes.
+# (keys from FirestoreSchema.Router), plus lastSeenAt, appVersion and the firmware
+# line on androidVersion. Strings from the network (hostnames, SSIDs) only reach
+# JSON through esc(); scalars arrive in the environment rather than via -v, which
+# would interpret their backslashes.
 # Fields with nothing to say are left out, which both owner clients read as null.
 PA_AWK_REPORT='
 function fstr(s) { return (s == "") ? "" : "{\"stringValue\":\"" esc(s) "\"}" }
@@ -1408,6 +1409,12 @@ END {
   out = put(out, "router", fmap(rt))
   out = put(out, "lastSeenAt", stamp)
   out = put(out, "appVersion", fstr(ENVIRON["PJ_AG"]))
+  # The firmware line, re-reported every check-in so an upgrade on the router
+  # refreshes the owner screen, rather than being frozen at the version read
+  # when it enrolled. It rides androidVersion, the field a phone writes its OS
+  # into. Left out when identity could not read it, so a blank never clobbers a
+  # good value (the updateMask in pa_write_report follows the same flag).
+  if (ENVIRON["PJ_FW"] != "") out = put(out, "androidVersion", fstr(ENVIRON["PJ_FW"]))
   # A router has only a coarse, IP-based position. It rides the very fields a
   # phone GPS fix uses, so the owner map and its accuracy disc place the router
   # as a wide somewhere-in-this-area circle with no router-specific client code.
@@ -1835,7 +1842,7 @@ pa_build_report() {
   PA_HAS_POSITION=0
   [ -n "$_plat" ] && PA_HAS_POSITION=1
   rm -f "$PA_TMP.history.added"
-  PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FULFIL=${PA_FULFIL:-0} \
+  PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FW=$PA_FW PJ_FULFIL=${PA_FULFIL:-0} \
     PJ_BOOTED=$_booted PJ_CPU=${PA_CPU:-} PJ_MU=${PA_MEM_USED:-} PJ_MT=${PA_MEM_TOTAL:-} \
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
@@ -2140,6 +2147,10 @@ pa_poll() {
 # 0 written, 1 no answer, 2 refused.
 pa_write_report() {
   _mask='updateMask.fieldPaths=router&updateMask.fieldPaths=lastSeenAt&updateMask.fieldPaths=appVersion'
+  # androidVersion carries the firmware line; name it only when identity read one,
+  # so an unknown firmware never deletes the value enrolment wrote. This matches
+  # the body's `PJ_FW != ""` guard in pa_build_report, so the two never disagree.
+  [ -n "$PA_FW" ] && _mask="$_mask&updateMask.fieldPaths=androidVersion"
   # Only name the position paths when this report carried a position, so a report
   # built while the IP lookup was down leaves the last good fix in place instead
   # of blanking it (a masked path with no value in the body is a field delete).
