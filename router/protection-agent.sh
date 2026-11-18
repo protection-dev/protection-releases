@@ -23,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.8.2 (17)"
+PA_AGENT_VERSION="1.9.0 (18)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -216,10 +216,10 @@ pa_init_platform() {
 pa_nvram_snapshot() {
   [ "$PA_PLATFORM" = merlin ] || return 0
   nvram show 2>/dev/null | awk -F= '
-    /^(wan_primary|wan[01]_(ifname|proto|ipaddr)|wl[0-3]_(ifname|nband|ssid|radio)|wl[0-3]\.[1-3]_bss_enabled|lan_ifname|productid|odmpid|buildno|extendno|firmver|lan_hwaddr|jffs2_scripts|custom_clientlist|ctf_disable)=/ {
+    /^(wan_primary|wan[01]_(ifname|proto|ipaddr|gateway)|wl[0-3]_(ifname|nband|ssid|radio)|wl[0-3]\.[1-3]_bss_enabled|lan_ifname|productid|odmpid|buildno|extendno|firmver|lan_hwaddr|jffs2_scripts|custom_clientlist|ctf_disable)=/ {
       key = $1; gsub(/\./, "_", key)
       print key "=" substr($0, length($1) + 2)
-    }' > "$PA_TMP.nv" 2>/dev/null
+    }' > "${PA_NV_FILE:-$PA_TMP.nv}" 2>/dev/null
   # Assigned, never evaluated: an SSID full of quotes and dollar signs is still
   # just text. The key was matched against a fixed list above.
   while IFS= read -r _line; do
@@ -229,8 +229,8 @@ pa_nvram_snapshot() {
     esac
     _v=${_line#*=}
     eval "PA_NV_$_k=\$_v"
-  done < "$PA_TMP.nv"
-  rm -f "$PA_TMP.nv"
+  done < "${PA_NV_FILE:-$PA_TMP.nv}"
+  rm -f "${PA_NV_FILE:-$PA_TMP.nv}"
 }
 
 # pa_nv NAME: a snapshotted nvram value into PA_V.
@@ -1380,6 +1380,8 @@ END {
   rt = put(rt, "wanRxBps", fint(rx))
   rt = put(rt, "wanTxBps", fint(tx))
   rt = put(rt, "wanHistory", farr(hist))
+  # Latency, jitter and loss from the background pinger, already a Firestore value.
+  rt = put(rt, "quality", ENVIRON["PJ_Q"])
   rt = put(rt, "clientCount", fint(n + 0))
   rt = put(rt, "clientUsageSince", fint(ENVIRON["PJ_USINCE"]))
   rt = put(rt, "clients", farr(clients))
@@ -1741,6 +1743,254 @@ pa_wifigeo() {
   [ "$PA_GEO_NOTE" = ok ] || pa_log "Wi-Fi positioning: $PA_GEO_NOTE"
 }
 
+# -- Connection quality ---------------------------------------------------------------
+
+# A background sampler pings the WAN gateway and an internet address every
+# PA_PING_INTERVAL seconds and appends one line per sample to $PA_TMP.ping:
+#   UPTIME GATEWAY_MS INTERNET_MS
+# with "-" for a ping that got no answer and "x" for a gateway it could not find.
+# A report summarises the file into router.quality: latency (the last minute's
+# average), jitter, loss, min/max/p95 over PA_PING_WINDOW, the gateway's latency,
+# and the last hour in PA_PING_BUCKETS points for the chart. Five seconds, not one:
+# two small pings and a sleep, so a busy router barely notices. In RAM, so a reboot
+# starts it again.
+PA_PING_INTERVAL=5
+PA_PING_WINDOW=300
+PA_PING_KEEP=3600
+PA_PING_BUCKETS=20
+# The internet address it pings, and a second one tried when the first is silent:
+# one service blocking ping is not packet loss.
+PA_PING_TARGET="${PA_PING_TARGET:-1.1.1.1}"
+PA_PING_FALLBACK="${PA_PING_FALLBACK:-8.8.8.8}"
+
+pa_is_ipv4() {
+  case $1 in
+    '' | *[!0-9.]* | *..* | .* | *.) return 1 ;;
+  esac
+  _o=$1
+  _i=0
+  while [ -n "$_o" ]; do
+    _p=${_o%%.*}
+    [ ${#_p} -le 3 ] && [ "$_p" -le 255 ] || return 1
+    _i=$((_i + 1))
+    case $_o in *.*) _o=${_o#*.} ;; *) _o='' ;; esac
+  done
+  [ "$_i" = 4 ]
+}
+
+# The WAN's next hop into PA_GW: the firmware's figure, else the default route's
+# gateway (/proc/net/route keeps it as little-endian hex). Empty when there is none
+# to find, as on a point-to-point link with no gateway address.
+pa_gateway() {
+  PA_GW=''
+  case $PA_PLATFORM in
+    merlin)
+      pa_nv wan_primary
+      _u=$PA_V
+      case $_u in [01]) ;; *) _u=0 ;; esac
+      pa_nv "wan${_u}_gateway"
+      PA_GW=$PA_V
+      ;;
+    openwrt)
+      if [ "$PA_NETSH" = 1 ]; then
+        network_flush_cache 2>/dev/null
+        network_get_gateway PA_GW wan 2>/dev/null
+        [ -n "$PA_GW" ] || {
+          _iface=''
+          network_find_wan _iface 2>/dev/null
+          [ -n "$_iface" ] && network_get_gateway PA_GW "$_iface" 2>/dev/null
+        }
+      fi
+      ;;
+  esac
+  if pa_is_ipv4 "$PA_GW" && [ "$PA_GW" != 0.0.0.0 ]; then return 0; fi
+  PA_GW=''
+  [ -r "$PA_ROOT/proc/net/route" ] || return 1
+  PA_GW=$(awk '
+    function hex(s,    i, n) {
+      n = 0
+      s = toupper(s)
+      for (i = 1; i <= length(s); i++) n = n * 16 + index("0123456789ABCDEF", substr(s, i, 1)) - 1
+      return n
+    }
+    NR > 1 && $2 == "00000000" && $8 == "00000000" && $3 != "00000000" && length($3) == 8 {
+      print hex(substr($3, 7, 2)) "." hex(substr($3, 5, 2)) "." hex(substr($3, 3, 2)) "." hex(substr($3, 1, 2))
+      exit
+    }' "$PA_ROOT/proc/net/route" 2>/dev/null)
+  pa_is_ipv4 "$PA_GW" || PA_GW=''
+  [ -n "$PA_GW" ]
+}
+
+# pa_ping HOST: one ping; its round trip in ms into PA_RTT, empty when nothing came
+# back within two seconds.
+pa_ping() {
+  PA_RTT=''
+  _po=$(ping -c 1 -W 2 "$1" 2>/dev/null)
+  case $_po in
+    *time=*) ;;
+    *) return 1 ;;
+  esac
+  _po=${_po#*time=}
+  _po=${_po%%[!0-9.]*}
+  case $_po in
+    '' | .* | *.*.*) return 1 ;;
+  esac
+  PA_RTT=$_po
+  return 0
+}
+
+# One sample, appended to $PA_TMP.ping.
+pa_ping_sample() {
+  pa_clock
+  _pt=$PA_NOW
+  _pg=x
+  if [ -n "${PA_GW:-}" ]; then
+    pa_ping "$PA_GW"
+    _pg=${PA_RTT:--}
+  fi
+  pa_ping "$PA_PING_TARGET" || pa_ping "$PA_PING_FALLBACK"
+  printf '%s %s %s\n' "$_pt" "$_pg" "${PA_RTT:--}" >> "$PA_TMP.ping"
+}
+
+# The sampler, run in the background by the service. It stops by itself once
+# $PA_TMP.pinger no longer holds its token: the agent stopped, or a newer agent
+# (an update re-executes in the same process) started a sampler of its own. So
+# there is never more than one, even after a kill -9.
+pa_pinger() {
+  _token=$1
+  # Its own scratch file: the service snapshots nvram for its reports at the same time.
+  PA_NV_FILE="$PA_TMP.nv.ping"
+  _n=0
+  while :; do
+    _cur=''
+    pa_read _cur "$PA_TMP.pinger"
+    [ "$_cur" = "$_token" ] || return 0
+    # The gateway can change (a new DHCP lease, PPPoE reconnecting): look again
+    # every five minutes.
+    if [ $((_n % 60)) = 0 ]; then
+      pa_nvram_snapshot
+      pa_gateway
+    fi
+    pa_ping_sample
+    _n=$((_n + 1))
+    if [ $((_n % 60)) = 0 ]; then
+      awk -v cut=$((PA_NOW - PA_PING_KEEP)) '$1 >= cut' "$PA_TMP.ping" > "$PA_TMP.ping.new" 2>/dev/null &&
+        mv -f "$PA_TMP.ping.new" "$PA_TMP.ping"
+    fi
+    ${PA_PING_SLEEP:-sleep} "$PA_PING_INTERVAL"
+  done
+}
+
+pa_pinger_start() {
+  pa_have ping || return 0
+  pa_read _pa_up "$PA_ROOT/proc/uptime"
+  _tok="$$ ${_pa_up%% *}"
+  printf '%s\n' "$_tok" > "$PA_TMP.pinger"
+  pa_pinger "$_tok" > /dev/null 2>&1 &
+  PA_PINGER_PID=$!
+}
+
+pa_pinger_stop() {
+  rm -f "$PA_TMP.pinger"
+  [ -n "${PA_PINGER_PID:-}" ] && kill "$PA_PINGER_PID" 2>/dev/null
+  PA_PINGER_PID=''
+  return 0
+}
+
+# The summary of $PA_TMP.ping as the Firestore value of router.quality, for the
+# report awk to put in as it is. Nothing when the sampler has said nothing for a
+# minute (not running, or no ping on this router).
+PA_AWK_QUALITY='
+function one(x) { return sprintf("%.1f", x) }
+function qd(x) { return "{\"doubleValue\":" one(x) "}" }
+function qi(x) { return "{\"integerValue\":\"" sprintf("%.0f", x) "\"}" }
+function qput(acc, name, v) {
+  if (acc != "") acc = acc ","
+  return acc "\"" name "\":" v
+}
+function rtt(v) { return v ~ /^[0-9]+(\.[0-9]+)?$/ }
+function dist(p1, p2) { return (p1 > p2) ? p1 - p2 : p2 - p1 }
+$1 ~ /^[0-9]+$/ {
+  t = $1 + 0
+  if (t > now || now - t >= keep) next
+  age = now - t
+  b = int(age / bw)
+  bn[b]++
+  if (rtt($3)) { bs[b] += $3; bk[b]++ }
+  if (age >= win) next
+  n++
+  if (t > last) last = t
+  if (rtt($3)) {
+    k++
+    v[k] = $3 + 0
+    s += $3
+    if (age < 60) { s1 += $3; k1++ }
+    if (prevok) { js += dist(v[k], v[k - 1]); jn++ }
+    prevok = 1
+  } else {
+    lost++
+    prevok = 0
+  }
+  if ($2 != "x") {
+    gn++
+    if (rtt($2)) {
+      gk++
+      gs += $2
+      if (age < 60) { gs1 += $2; gk1++ }
+    }
+  }
+}
+END {
+  if (n == 0 || now - last > 60) exit
+  q = ""
+  q = qput(q, "target", "{\"stringValue\":\"" target "\"}")
+  q = qput(q, "windowSeconds", qi(win))
+  q = qput(q, "samples", qi(n))
+  if (k1 > 0) q = qput(q, "latencyMs", qd(s1 / k1))
+  else if (k > 0) q = qput(q, "latencyMs", qd(s / k))
+  if (jn > 0) q = qput(q, "jitterMs", qd(js / jn))
+  q = qput(q, "lossPercent", qd(lost * 100 / n))
+  if (k > 0) {
+    for (i = 1; i <= k; i++) {
+      x = v[i]
+      for (j = i - 1; j >= 1 && w[j] > x; j--) w[j + 1] = w[j]
+      w[j + 1] = x
+    }
+    p = int(k * 0.95)
+    if (p < k * 0.95) p++
+    if (p < 1) p = 1
+    q = qput(q, "minMs", qd(w[1]))
+    q = qput(q, "maxMs", qd(w[k]))
+    q = qput(q, "p95Ms", qd(w[p]))
+  }
+  if (gk1 > 0) q = qput(q, "gatewayMs", qd(gs1 / gk1))
+  else if (gk > 0) q = qput(q, "gatewayMs", qd(gs / gk))
+  if (gn > 0) q = qput(q, "gatewayLossPercent", qd((gn - gk) * 100 / gn))
+  h = ""
+  for (b = int(keep / bw) - 1; b >= 0; b--) {
+    if (!(b in bn)) continue
+    x = qput("", "at", qi(nowms - b * bw * 1000))
+    if (bk[b] > 0) x = qput(x, "latencyMs", qd(bs[b] / bk[b]))
+    x = qput(x, "lossPercent", qd((bn[b] - bk[b]) * 100 / bn[b]))
+    if (h != "") h = h ","
+    h = h "{\"mapValue\":{\"fields\":{" x "}}}"
+  }
+  if (h != "") q = qput(q, "history", "{\"arrayValue\":{\"values\":[" h "]}}")
+  printf "{\"mapValue\":{\"fields\":{%s}}}", q
+}
+'
+
+# pa_quality NOWMS: the router.quality value into PA_QUALITY (empty when none).
+pa_quality() {
+  PA_QUALITY=''
+  [ -r "$PA_TMP.ping" ] || return 0
+  pa_clock
+  PA_QUALITY=$(awk -v now="$PA_NOW" -v nowms="$1" -v win="$PA_PING_WINDOW" -v keep="$PA_PING_KEEP" \
+    -v bw=$((PA_PING_KEEP / PA_PING_BUCKETS)) -v target="$PA_PING_TARGET" \
+    "$PA_AWK_QUALITY" "$PA_TMP.ping" 2>/dev/null)
+  return 0
+}
+
 # Collects everything and prints the Firestore write for a full report. PA_FULFIL=1
 # also marks an owner Refresh answered.
 pa_build_report() {
@@ -1842,7 +2092,8 @@ pa_build_report() {
   PA_HAS_POSITION=0
   [ -n "$_plat" ] && PA_HAS_POSITION=1
   rm -f "$PA_TMP.history.added"
-  PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FW=$PA_FW PJ_FULFIL=${PA_FULFIL:-0} \
+  pa_quality "$_nowms"
+  PJ_Q=$PA_QUALITY PJ_NOW_MS=$_nowms PJ_ISO=$PA_ISO PJ_AG=$PA_AGENT_VERSION PJ_FW=$PA_FW PJ_FULFIL=${PA_FULFIL:-0} \
     PJ_BOOTED=$_booted PJ_CPU=${PA_CPU:-} PJ_MU=${PA_MEM_USED:-} PJ_MT=${PA_MEM_TOTAL:-} \
     PJ_TC=${PA_TEMP:-} PJ_FAN=${PA_FAN:-} PJ_WANUP=$_wanup PJ_WIP=$_wip PJ_ISP=$PA_ISP \
     PJ_LOC=$PA_LOC PJ_WT=${PA_WAN_TYPE:-} PJ_OA=$_oa PJ_OB=$_ob \
@@ -2481,8 +2732,9 @@ pa_exit() {
   [ -n "${PA_SLEEP_PID:-}" ] && kill "$PA_SLEEP_PID" 2>/dev/null
   _owner=''
   pa_read _owner "$PA_PIDFILE"
+  [ -n "${PA_PINGER_PID:-}" ] && kill "$PA_PINGER_PID" 2>/dev/null
   if [ "$_owner" = "$$" ]; then
-    rm -f "$PA_PIDFILE" "$PA_TMP.auth" "$PA_TMP.req" "$PA_TMP.resp" "$PA_TMP.body"
+    rm -f "$PA_PIDFILE" "$PA_TMP.auth" "$PA_TMP.req" "$PA_TMP.resp" "$PA_TMP.body" "$PA_TMP.pinger"
   fi
   exit 0
 }
@@ -2512,6 +2764,9 @@ pa_run() {
   # Fresh from an update (or back from one that failed): may hand over to the
   # agent this one replaced, here and now.
   pa_trial_begin
+  # The connection-quality sampler. Not under the tests' stand-in sleep: they drive
+  # pa_pinger themselves.
+  [ -n "${PA_SLEEP:-}" ] || pa_pinger_start
 
   PA_LAST_FULL=''
   PA_PENDING_FULL=1
@@ -2574,6 +2829,7 @@ pa_run() {
       pa_sleep "$_wait"
     fi
   done
+  pa_pinger_stop
   rm -f "$PA_PIDFILE" "$PA_TMP.auth"
 }
 
@@ -3150,6 +3406,27 @@ pa_doctor() {
   if [ -n "${PA_TEMP:-}" ]; then _health="$_health, temperature $PA_TEMP C"; else _health="$_health, no temperature sensor"; fi
   [ -n "${PA_FAN:-}" ] && _health="$_health, fan $PA_FAN rpm"
   pa_doc Health: "$_health"
+  # Connection quality: one ping each way, as the sampler would.
+  if pa_have ping; then
+    pa_gateway
+    if [ -z "$PA_GW" ]; then
+      _lat='no WAN gateway found'
+    elif pa_ping "$PA_GW"; then
+      _lat="gateway $PA_GW $PA_RTT ms"
+    else
+      _lat="gateway $PA_GW no answer"
+    fi
+    if pa_ping "$PA_PING_TARGET"; then
+      _lat="$_lat, internet $PA_RTT ms ($PA_PING_TARGET)"
+    elif pa_ping "$PA_PING_FALLBACK"; then
+      _lat="$_lat, internet $PA_RTT ms ($PA_PING_FALLBACK)"
+    else
+      _lat="$_lat, internet no answer"
+    fi
+  else
+    _lat='no ping on this router: no latency, jitter or loss'
+  fi
+  pa_doc Latency: "$_lat"
   pa_doc Wi-Fi: "$_radios radio(s), $_stations device(s) connected"
   _missing=''
   if [ "$_radios" -gt 0 ]; then
