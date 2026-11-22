@@ -23,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.9.0 (18)"
+PA_AGENT_VERSION="1.9.1 (19)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -69,6 +69,7 @@ PA_MIN_EPOCH=1735689600
 
 PA_TMP="$PA_ROOT/tmp/protection-agent"
 PA_PIDFILE="$PA_TMP.pid"
+PA_ALIVE="$PA_TMP.alive"
 PA_MARK="# protection-agent"
 
 PA_AUTH_URL="${PA_AUTH_URL:-https://identitytoolkit.googleapis.com/v1/accounts:signUp}"
@@ -112,6 +113,16 @@ PA_UPDATE_WINDOW=600
 # it replaced.
 PA_TRIAL_STARTS=3
 PA_TRIAL_DEADLINE=1800
+# The longest `nvram show` may take (a fraction of a second normally). On an
+# RT-AX86U Pro (Merlin 3006) it once waited on the firmware's socket for hours, and
+# the loop waited with it: no report, so the router read as Offline while the agent
+# was alive and nothing restarted it. Past this, the read is killed and the last
+# values are kept.
+PA_NVRAM_WAIT="${PA_NVRAM_WAIT:-20}"
+# Anything else that hangs: before every sleep the loop writes when it will be back,
+# plus this long for the contact that follows. An agent past that has stopped going
+# round, and `start` (cru runs it every 10 minutes on Merlin) starts it afresh.
+PA_STALL_GRACE=900
 
 # -- Small helpers -----------------------------------------------------------------
 
@@ -213,13 +224,34 @@ pa_init_platform() {
 
 # Merlin: one `nvram show` per report instead of a fork per variable. Only the
 # variables the agent reads are kept, as PA_NV_<name> with dots made underscores.
+# With a time limit: an nvram that never answers keeps the last values (none yet
+# at a start) rather than holding up the loop.
 pa_nvram_snapshot() {
   [ "$PA_PLATFORM" = merlin ] || return 0
-  nvram show 2>/dev/null | awk -F= '
+  _nvf=${PA_NV_FILE:-$PA_TMP.nv}
+  nvram show > "$_nvf.raw" 2>/dev/null &
+  _nvp=$!
+  # The watcher holds none of our output open: a command substitution around a
+  # caller would otherwise wait for its sleep.
+  { sleep "$PA_NVRAM_WAIT"; kill -9 "$_nvp"; } < /dev/null > /dev/null 2>&1 &
+  _nvk=$!
+  # Both reaped with stderr shut: a shell reports a killed job ("Killed …") there,
+  # which `report` and `doctor` would print on every read.
+  wait "$_nvp" 2>/dev/null
+  _nvrc=$?
+  kill -9 "$_nvk" 2>/dev/null
+  wait "$_nvk" 2>/dev/null
+  if [ "$_nvrc" -gt 128 ]; then
+    rm -f "$_nvf.raw"
+    pa_log "nvram did not answer within ${PA_NVRAM_WAIT}s; kept its last values"
+    return 0
+  fi
+  awk -F= '
     /^(wan_primary|wan[01]_(ifname|proto|ipaddr|gateway)|wl[0-3]_(ifname|nband|ssid|radio)|wl[0-3]\.[1-3]_bss_enabled|lan_ifname|productid|odmpid|buildno|extendno|firmver|lan_hwaddr|jffs2_scripts|custom_clientlist|ctf_disable)=/ {
       key = $1; gsub(/\./, "_", key)
       print key "=" substr($0, length($1) + 2)
-    }' > "${PA_NV_FILE:-$PA_TMP.nv}" 2>/dev/null
+    }' "$_nvf.raw" > "$_nvf" 2>/dev/null
+  rm -f "$_nvf.raw"
   # Assigned, never evaluated: an SSID full of quotes and dollar signs is still
   # just text. The key was matched against a fixed list above.
   while IFS= read -r _line; do
@@ -229,8 +261,8 @@ pa_nvram_snapshot() {
     esac
     _v=${_line#*=}
     eval "PA_NV_$_k=\$_v"
-  done < "${PA_NV_FILE:-$PA_TMP.nv}"
-  rm -f "${PA_NV_FILE:-$PA_TMP.nv}"
+  done < "$_nvf"
+  rm -f "$_nvf"
 }
 
 # pa_nv NAME: a snapshotted nvram value into PA_V.
@@ -2611,7 +2643,53 @@ pa_running_pid() {
   return 0
 }
 
+# pa_alive SECONDS: the loop is about to sleep this long. Notes this agent's pid
+# and the uptime by which it will have gone round again, contact included.
+pa_alive() {
+  pa_clock
+  printf '%s %s\n' "$$" $((PA_NOW + $1 + PA_STALL_GRACE)) > "$PA_ALIVE" 2>/dev/null
+  return 0
+}
+
+# Whether the running agent (PA_PID) has stopped going round: alive, but past the
+# time it noted. An agent that notes nothing (older than 1.9.1, or one rolled back
+# to) is never taken for stuck: the note has to be its own.
+pa_stalled() {
+  [ -r "$PA_ALIVE" ] || return 1
+  _ap=''
+  _by=''
+  read -r _ap _by < "$PA_ALIVE"
+  [ "$_ap" = "$PA_PID" ] || return 1
+  pa_isnum "$_by" || return 1
+  pa_clock
+  [ "$PA_NOW" -gt "$_by" ]
+}
+
+# pa_kill_stuck PID: the agent and everything under it (the hung command, the
+# quality sampler), with KILL, since a stuck shell runs no trap and its children
+# would hang on without it.
+pa_kill_stuck() {
+  _ks=$(awk -v root="$1" '
+    FNR == 1 { p = FILENAME; sub(/\/status$/, "", p); sub(/.*\//, "", p) }
+    /^PPid:/ { par[p] = $2 }
+    END {
+      keep[root] = 1
+      more = 1
+      while (more) {
+        more = 0
+        for (c in par) if (!(c in keep) && (par[c] in keep)) { keep[c] = 1; more = 1 }
+      }
+      for (c in keep) if (c != root) print c
+    }' /proc/[0-9]*/status 2>/dev/null)
+  # The agent first, so it starts nothing new, then what it left behind.
+  kill -9 "$1" 2>/dev/null
+  # shellcheck disable=SC2086
+  [ -n "$_ks" ] && kill -9 $_ks 2>/dev/null
+  return 0
+}
+
 pa_sleep() {
+  pa_alive "$1"
   if [ -n "${PA_SLEEP:-}" ]; then
     $PA_SLEEP "$1"
     return 0
@@ -2734,7 +2812,7 @@ pa_exit() {
   pa_read _owner "$PA_PIDFILE"
   [ -n "${PA_PINGER_PID:-}" ] && kill "$PA_PINGER_PID" 2>/dev/null
   if [ "$_owner" = "$$" ]; then
-    rm -f "$PA_PIDFILE" "$PA_TMP.auth" "$PA_TMP.req" "$PA_TMP.resp" "$PA_TMP.body" "$PA_TMP.pinger"
+    rm -f "$PA_PIDFILE" "$PA_ALIVE" "$PA_TMP.auth" "$PA_TMP.req" "$PA_TMP.resp" "$PA_TMP.body" "$PA_TMP.pinger"
   fi
   exit 0
 }
@@ -2749,6 +2827,9 @@ pa_run() {
     pa_die "already running (pid $PA_PID)."
   fi
   printf '%s\n' "$$" > "$PA_PIDFILE"
+  # Starting up reads the whole router once (nvram, Wi-Fi, the connection table):
+  # it is held to the same deadline as a contact.
+  pa_alive 0
   trap pa_exit INT TERM
   # The SSH session that started it closing must not take it down.
   trap '' HUP
@@ -2846,7 +2927,12 @@ pa_start() {
     pa_initd start
     return $?
   fi
-  pa_running_pid && return 0
+  if pa_running_pid; then
+    pa_stalled || return 0
+    pa_log "the agent (pid $PA_PID) stopped going round; starting it afresh"
+    pa_kill_stuck "$PA_PID"
+    rm -f "$PA_PIDFILE"
+  fi
   mkdir -p "$(dirname "$PA_TMP")"
   # Detached from the SSH session that started it: its own session where BusyBox
   # has setsid, immune to hangup otherwise.
@@ -2858,7 +2944,8 @@ pa_start() {
     sh "$PA_BIN" run < /dev/null > /dev/null 2>&1 &
   fi
   if [ "$PA_PLATFORM" = merlin ] && pa_have cru; then
-    # A watchdog: `start` is a no-op while the agent runs, and restarts it if not.
+    # A watchdog: `start` is a no-op while the agent runs, and restarts it if not,
+    # or if it has stopped going round (pa_stalled).
     cru l 2>/dev/null | grep -q "#protection-agent#" \
       || cru a protection-agent "*/10 * * * * $PA_BIN start"
   fi
@@ -3004,6 +3091,9 @@ pa_sync() {
 # watches and the pid file names stays right. A function, so the tests can stand
 # in for it.
 pa_reexec() {
+  # Same pid, so this agent's deadline would pass for the next one's. An agent too
+  # old to write one (a rollback) would then be restarted as stuck once.
+  rm -f "$PA_ALIVE"
   exec sh "$PA_BIN" run
 }
 
