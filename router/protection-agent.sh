@@ -23,7 +23,7 @@
 # PA_SOURCED=1 loads the functions without running anything, PA_FAKE_EPOCH pins
 # the wall clock, and PA_SCAN_WAIT is how long a Merlin Wi-Fi scan is given.
 
-PA_AGENT_VERSION="1.9.1 (19)"
+PA_AGENT_VERSION="1.9.2 (20)"
 PA_ROOT="${PA_ROOT:-}"
 
 # Cadence, in seconds. One read of its own document per contact, one write per
@@ -119,10 +119,14 @@ PA_TRIAL_DEADLINE=1800
 # was alive and nothing restarted it. Past this, the read is killed and the last
 # values are kept.
 PA_NVRAM_WAIT="${PA_NVRAM_WAIT:-20}"
-# Anything else that hangs: before every sleep the loop writes when it will be back,
-# plus this long for the contact that follows. An agent past that has stopped going
-# round, and `start` (cru runs it every 10 minutes on Merlin) starts it afresh.
-PA_STALL_GRACE=900
+# Anything else that hangs: at the top of every round and before every sleep the
+# loop writes when it will be back, plus this long for a contact (a dozen requests
+# at their 30 s limit). An agent past that has stopped going round, and the
+# watchdog, every PA_WATCH_EVERY seconds, starts it afresh: cru running `start` on
+# Merlin, a second procd instance running `watchdog` on OpenWrt. A hang is then
+# normally over before the app reaches its 15-minute Offline threshold.
+PA_STALL_GRACE=360
+PA_WATCH_EVERY=120
 
 # -- Small helpers -----------------------------------------------------------------
 
@@ -2834,6 +2838,7 @@ pa_run() {
   # The SSH session that started it closing must not take it down.
   trap '' HUP
   pa_init_platform
+  pa_initd_refresh
   pa_nvram_snapshot
   pa_identity
   pa_wan
@@ -2861,6 +2866,8 @@ pa_run() {
   while :; do
     _loops=$((_loops + 1))
     [ -n "${PA_MAX_LOOPS:-}" ] && [ "$_loops" -gt "$PA_MAX_LOOPS" ] && break
+    # The round about to run gets its own PA_STALL_GRACE, however long it slept.
+    pa_alive 0
     pa_clock
     if [ "$PA_TRIAL" = 1 ] && [ $((PA_NOW - PA_TRIAL_AT)) -ge "$PA_TRIAL_DEADLINE" ]; then
       pa_rollback "$PA_TRIAL_FROM" "could not report"
@@ -2923,16 +2930,15 @@ pa_initd() {
 
 pa_start() {
   pa_load_conf || pa_die "not enrolled. Run: protection-agent setup CODE PROJECT KEY"
+  pa_unstick
   if [ "$PA_PLATFORM" = openwrt ] && [ -x "$PA_ROOT/etc/init.d/protection-agent" ]; then
     pa_initd start
     return $?
   fi
-  if pa_running_pid; then
-    pa_stalled || return 0
-    pa_log "the agent (pid $PA_PID) stopped going round; starting it afresh"
-    pa_kill_stuck "$PA_PID"
-    rm -f "$PA_PIDFILE"
-  fi
+  # Before the running agent makes this a no-op: an agent update changes the
+  # schedule, and cru's own `start` is what brings it in.
+  [ "$PA_PLATFORM" = merlin ] && pa_have cru && pa_cru_watchdog
+  pa_running_pid && return 0
   mkdir -p "$(dirname "$PA_TMP")"
   # Detached from the SSH session that started it: its own session where BusyBox
   # has setsid, immune to hangup otherwise.
@@ -2943,12 +2949,33 @@ pa_start() {
   else
     sh "$PA_BIN" run < /dev/null > /dev/null 2>&1 &
   fi
-  if [ "$PA_PLATFORM" = merlin ] && pa_have cru; then
-    # A watchdog: `start` is a no-op while the agent runs, and restarts it if not,
-    # or if it has stopped going round (pa_stalled).
-    cru l 2>/dev/null | grep -q "#protection-agent#" \
-      || cru a protection-agent "*/10 * * * * $PA_BIN start"
-  fi
+  return 0
+}
+
+# pa_unstick: kills the running agent when it has stopped going round, so it can
+# be started afresh (by `start` on Merlin, by procd's respawn on OpenWrt). 0 when
+# it did.
+pa_unstick() {
+  pa_running_pid || return 1
+  pa_stalled || return 1
+  pa_log "the agent (pid $PA_PID) stopped going round; starting it afresh"
+  pa_kill_stuck "$PA_PID"
+  rm -f "$PA_PIDFILE"
+  return 0
+}
+
+# Merlin's watchdog: cru runs `start` every PA_WATCH_EVERY seconds, which is a no-op
+# while the agent runs, starts it if not, and starts it afresh if it is stuck.
+# Rewritten when it differs (an older agent's every-10-minutes, or a duplicate).
+pa_cru_watchdog() {
+  _cron="*/$((PA_WATCH_EVERY / 60)) * * * * $PA_BIN start"
+  case $(cru l 2>/dev/null | grep "#protection-agent#") in
+    "$_cron #protection-agent#") ;;
+    *)
+      cru d protection-agent 2>/dev/null
+      cru a protection-agent "$_cron"
+      ;;
+  esac
   return 0
 }
 
@@ -3236,6 +3263,50 @@ pa_install_self() {
   rm -f "$PA_BIN.prev" "$PA_BIN.trial" "$PA_BIN.trial.new"
 }
 
+# OpenWrt's procd service. procd restarts the agent when it exits, never when it
+# hangs, so a second instance is its watchdog: `watchdog` every PA_WATCH_EVERY
+# seconds kills an agent that has stopped going round, and procd's respawn brings
+# it back. The agent's own instance stays first and unnamed, so a service written
+# by an older agent differs only by the watchdog and a reload leaves the agent be.
+pa_initd_script() {
+  cat <<EOF
+#!/bin/sh /etc/rc.common
+$PA_MARK: installed by 'protection-agent setup'.
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command $PA_BIN run
+	procd_set_param respawn 3600 10 0
+	procd_close_instance
+	procd_open_instance watchdog
+	procd_set_param command /bin/sh -c "while sleep $PA_WATCH_EVERY; do $PA_BIN watchdog; done"
+	procd_set_param respawn 3600 10 0
+	procd_close_instance
+}
+EOF
+}
+
+# A router set up by an older agent and updated from the app keeps the service
+# that setup wrote, since an update replaces the agent alone. At each start the
+# agent brings that service up to date and has procd reload it, which starts what
+# is new (the watchdog) without restarting the agent.
+pa_initd_refresh() {
+  [ "$PA_PLATFORM" = openwrt ] || return 0
+  _init="$PA_ROOT/etc/init.d/protection-agent"
+  # Only a service setup installed: never one written by hand.
+  grep -q "$PA_MARK" "$_init" 2>/dev/null || return 0
+  _want=$(pa_initd_script)
+  [ "$(cat "$_init")" = "$_want" ] && return 0
+  printf '%s\n' "$_want" > "$_init"
+  chmod 755 "$_init"
+  pa_log "updated its procd service (watchdog)"
+  pa_initd reload > /dev/null 2>&1
+  return 0
+}
+
 pa_autostart_on() {
   case $PA_PLATFORM in
     merlin)
@@ -3257,20 +3328,7 @@ pa_autostart_on() {
     openwrt)
       _init="$PA_ROOT/etc/init.d/protection-agent"
       mkdir -p "$PA_ROOT/etc/init.d"
-      cat > "$_init" <<EOF
-#!/bin/sh /etc/rc.common
-$PA_MARK: installed by 'protection-agent setup'.
-START=99
-STOP=10
-USE_PROCD=1
-
-start_service() {
-	procd_open_instance
-	procd_set_param command $PA_BIN run
-	procd_set_param respawn 3600 10 0
-	procd_close_instance
-}
-EOF
+      pa_initd_script > "$_init"
       chmod 755 "$_init"
       pa_initd enable 2>/dev/null
       # Keep the agent and its credential across a firmware upgrade, and the
@@ -3607,6 +3665,11 @@ pa_main() {
     run) pa_run ;;
     start) pa_start ;;
     stop) pa_stop ;;
+    watchdog)
+      # OpenWrt's procd runs this every PA_WATCH_EVERY seconds (Merlin: cru, `start`).
+      pa_load_conf && pa_unstick
+      return 0
+      ;;
     restart)
       pa_stop
       pa_start
